@@ -1,10 +1,10 @@
-"packageManager": "npm@11.6.2"
 
 {
   "name": "test-application",
   "version": "0.1.0",
   "private": true,
-  "scripts": {
+"packageManager": "npm@11.6.2",
+"scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",

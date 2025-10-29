@@ -1,4 +1,6 @@
 // app/api/ingest/route.ts
+export const runtime = 'nodejs';
+
 import { NextResponse } from 'next/server';
 import * as cheerio from 'cheerio';
 import OpenAI from 'openai';

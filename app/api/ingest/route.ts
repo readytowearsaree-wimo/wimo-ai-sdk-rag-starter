@@ -29,6 +29,14 @@ async function fetchHtmlAsText(url: string) {
 export function GET() {
   return NextResponse.json({ ok: true, msg: 'ingest route is alive' });
 }
+export async function GET() {
+  return NextResponse.json({
+    ok: true,
+    hasEnv: !!process.env.SUPABASE_CONN,
+    sample: process.env.SUPABASE_CONN?.slice(0, 30) + '...'
+  });
+}
+
 
 export async function POST(req: Request) {
   try {

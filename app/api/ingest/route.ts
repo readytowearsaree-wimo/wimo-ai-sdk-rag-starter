@@ -6,10 +6,9 @@ import cheerio from 'cheerio';
 import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
 import pkg from 'pg';
-
 const { Client } = pkg;
 
-// -------- helpers --------
+// ---------- Helpers ----------
 function chunkText(text: string, maxLen = 3500) {
   const chunks: string[] = [];
   let i = 0;
@@ -30,14 +29,13 @@ async function fetchHtmlAsText(url: string) {
   return text;
 }
 
-// Small utility to ensure we fail fast if env is missing
 function requireEnv(name: string) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing required env var: ${name}`);
   return v;
 }
 
-// -------- GET: quick health check (also shows if env is loaded) --------
+// ---------- GET: health check ----------
 export async function GET() {
   return NextResponse.json({
     ok: true,
@@ -46,7 +44,7 @@ export async function GET() {
   });
 }
 
-// -------- POST: ingest a single URL --------
+// ---------- POST: ingestion ----------
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
@@ -64,17 +62,14 @@ export async function POST(req: Request) {
 
     const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
     const client = new Client({ connectionString: SUPABASE_CONN });
-
     await client.connect();
 
-    // 1) fetch and clean page text
     const text = await fetchHtmlAsText(url);
     if (!text) {
       await client.end();
       return NextResponse.json({ ok: false, error: 'No text extracted from page' }, { status: 422 });
     }
 
-    // 2) upsert into documents and get the id
     const upsert = await client.query(
       `
       insert into documents (id, url, content, meta)
@@ -87,22 +82,18 @@ export async function POST(req: Request) {
     );
     const docId: string = upsert.rows[0].id;
 
-    // 3) remove old chunks for this doc id (fresh re-index)
     await client.query(`delete from document_chunks where document_id = $1`, [docId]);
 
-    // 4) chunk, embed, and insert
     const chunks = chunkText(text);
     let inserted = 0;
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
-
       const emb = await openai.embeddings.create({
         model: 'text-embedding-3-small',
         input: chunk,
       });
-
-      const vector = emb.data[0].embedding; // number[]
+      const vector = emb.data[0].embedding;
 
       await client.query(
         `

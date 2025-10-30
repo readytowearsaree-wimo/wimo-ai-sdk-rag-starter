@@ -6,10 +6,9 @@ import * as cheerio from 'cheerio';
 import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
 import pkg from 'pg';
-
 const { Client } = pkg;
 
-// split text
+// Helper: split large text into chunks
 function chunkText(text: string, maxLen = 4000) {
   const chunks: string[] = [];
   let i = 0;
@@ -20,76 +19,27 @@ function chunkText(text: string, maxLen = 4000) {
   return chunks;
 }
 
-// fetch HTML → text
+// Helper: fetch and extract clean text from a URL
 async function fetchHtmlAsText(url: string) {
   const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) {
-    throw new Error(`fetch failed for ${url}: ${res.status}`);
-  }
   const html = await res.text();
   const $ = cheerio.load(html);
-  $('script,style,noscript,nav,footer').remove();
+  $('script,noscript,nav,footer,style').remove();
   const text = $('body').text().replace(/\s+/g, ' ').trim();
   return text;
 }
 
-/**
- * Fetch a sitemap URL.
- * - If it is a normal urlset → return that list
- * - If it is a sitemapindex → fetch each child sitemap and aggregate all urls
- */
-async function fetchSitemapUrlsDeep(sitemapUrl: string): Promise<string[]> {
-  const res = await fetch(sitemapUrl, { cache: 'no-store' });
-  if (!res.ok) {
-    throw new Error(`sitemap fetch failed: ${res.status}`);
-  }
-  const xml = await res.text();
-  const $ = cheerio.load(xml, { xmlMode: true });
-
-  // 1) try normal <urlset>
-  const pageUrls: string[] = [];
-  $('url > loc').each((i, el) => {
-    const loc = $(el).text().trim();
-    if (loc) pageUrls.push(loc);
-  });
-  if (pageUrls.length > 0) {
-    return pageUrls;
-  }
-
-  // 2) if no <url>, maybe it's a sitemapindex → collect child sitemaps
-  const sitemapUrls: string[] = [];
-  $('sitemap > loc').each((i, el) => {
-    const loc = $(el).text().trim();
-    if (loc) sitemapUrls.push(loc);
-  });
-
-  if (sitemapUrls.length === 0) {
-    // nothing we can do
-    return [];
-  }
-
-  // 3) fetch each child sitemap and collect their urls
-  const all: string[] = [];
-  for (const child of sitemapUrls) {
-    try {
-      const childUrls = await fetchSitemapUrlsDeep(child);
-      all.push(...childUrls);
-    } catch (err) {
-      console.error('child sitemap failed', child, err);
-    }
-  }
-  return all;
-}
-
-// simple GET
+// Healthcheck
 export async function GET() {
-  return NextResponse.json({ ok: true, msg: 'ingest route is alive' });
+  return NextResponse.json({ ok: true, msg: 'ingest route is alive ✅' });
 }
 
+// POST: handle sitemap or single-page ingestion
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as any;
-    // Secret check (ensure this happens before anything else)
+
+    // ✅ Secret check (security)
     const secretHeader = req.headers.get('x-ingest-secret');
     const expectedSecret = process.env.INGEST_SECRET;
 
@@ -97,7 +47,7 @@ export async function POST(req: Request) {
     console.log('🔑 Expected secret:', expectedSecret);
 
     if (!expectedSecret) {
-      console.error('Missing INGEST_SECRET in environment');
+      console.error('❌ Missing INGEST_SECRET in environment');
       return NextResponse.json(
         { ok: false, error: 'missing server secret' },
         { status: 500 }
@@ -105,118 +55,110 @@ export async function POST(req: Request) {
     }
 
     if (secretHeader !== expectedSecret) {
-      console.error('Secret mismatch');
+      console.error('❌ Secret mismatch');
       return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
     }
 
-
-    // allow several keys
+    // ✅ Handle inputs
     const sitemapUrl =
       body.sitemapUrl || body.sitemapurl || body.sitemap || body.siteMapUrl;
     const singleUrl = body.url;
 
-    // secret check
-    const secretHeader = req.headers.get('x-ingest-secret');
-    const expectedSecret = process.env.INGEST_SECRET;
-    if (expectedSecret && secretHeader !== expectedSecret) {
-      return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
+    if (!sitemapUrl && !singleUrl) {
+      return NextResponse.json({ ok: false, error: 'No URL provided' });
     }
 
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    const SUPABASE_CONN = process.env.SUPABASE_CONN;
-    if (!OPENAI_API_KEY || !SUPABASE_CONN) {
-      return NextResponse.json(
-        { ok: false, error: 'Missing OPENAI_API_KEY or SUPABASE_CONN' },
-        { status: 500 }
-      );
-    }
+    const client = new Client({
+      connectionString: process.env.SUPABASE_CONN,
+      ssl: { rejectUnauthorized: false },
+    });
+    await client.connect();
 
-    // helper: ingest ONE page
-    const ingestOne = async (pageUrl: string) => {
-      const client = new Client({ connectionString: SUPABASE_CONN });
-      await client.connect();
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const mode = sitemapUrl ? 'sitemap' : 'single';
 
-      const text = await fetchHtmlAsText(pageUrl);
-      if (!text) {
-        await client.end();
-        return { ok: false, error: 'no text', url: pageUrl };
+    // ✅ If sitemap ingestion
+    if (sitemapUrl) {
+      console.log(`📄 Fetching sitemap: ${sitemapUrl}`);
+      const sitemapRes = await fetch(sitemapUrl);
+      const sitemapXml = await sitemapRes.text();
+      const $ = cheerio.load(sitemapXml, { xmlMode: true });
+      const locs = $('loc')
+        .map((_, el) => $(el).text())
+        .get();
+
+      console.log(`Found ${locs.length} URLs in sitemap.`);
+
+      let success = 0;
+      let fail = 0;
+
+      for (const loc of locs) {
+        try {
+          const text = await fetchHtmlAsText(loc);
+          const chunks = chunkText(text);
+          for (const chunk of chunks) {
+            const embedding = await openai.embeddings.create({
+              model: 'text-embedding-3-small',
+              input: chunk,
+            });
+            const vector = embedding.data[0].embedding;
+
+            await client.query(
+              `INSERT INTO documents (id, url, content, embedding)
+               VALUES ($1, $2, $3, $4)`,
+              [uuidv4(), loc, chunk, vector]
+            );
+          }
+          success++;
+        } catch (err) {
+          console.error(`❌ Failed to ingest ${loc}`, err);
+          fail++;
+        }
       }
 
-      const docId = uuidv4();
+      await client.end();
+      return NextResponse.json({
+        ok: true,
+        mode,
+        sitemapUrl,
+        ingested: success,
+        failed: fail,
+      });
+    }
 
-      // your documents table has NO "meta" column, so just id/url/content
-      await client.query(
-        `
-        insert into documents (id, url, content)
-        values ($1, $2, $3)
-        on conflict (url) do update set content = excluded.content
-        `,
-        [docId, pageUrl, text]
-      );
-
-      await client.query('delete from document_chunks where document_id = $1', [docId]);
-
-      const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+    // ✅ If single page ingestion
+    if (singleUrl) {
+      console.log(`🧩 Ingesting single URL: ${singleUrl}`);
+      const text = await fetchHtmlAsText(singleUrl);
       const chunks = chunkText(text);
 
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        const emb = await openai.embeddings.create({
+      for (const chunk of chunks) {
+        const embedding = await openai.embeddings.create({
           model: 'text-embedding-3-small',
           input: chunk,
         });
-        const vector = emb.data[0].embedding;
+        const vector = embedding.data[0].embedding;
 
         await client.query(
-          `
-          insert into document_chunks (id, document_id, chunk_index, content, embedding)
-          values ($1, $2, $3, $4, $5::vector)
-          `,
-          [uuidv4(), docId, i, chunk, JSON.stringify(vector)]
+          `INSERT INTO documents (id, url, content, embedding)
+           VALUES ($1, $2, $3, $4)`,
+          [uuidv4(), singleUrl, chunk, vector]
         );
       }
 
       await client.end();
-      return { ok: true, url: pageUrl, chunks: chunks.length };
-    };
-
-    // --------------- SITEMAP MODE ---------------
-    if (sitemapUrl) {
-      const allUrls = await fetchSitemapUrlsDeep(sitemapUrl);
-
-      let ingested = 0;
-      let failed = 0;
-
-      // do sequential first (safe for your small Supabase)
-      for (const u of allUrls) {
-        try {
-          await ingestOne(u);
-          ingested++;
-        } catch (err) {
-          console.error('ingest failed for', u, err);
-          failed++;
-        }
-      }
-
       return NextResponse.json({
         ok: true,
-        mode: 'sitemap',
-        sitemapUrl,
-        found: allUrls.length,
-        ingested,
-        failed,
+        mode,
+        url: singleUrl,
+        ingested: chunks.length,
       });
     }
-
-    // --------------- SINGLE URL MODE ---------------
-    if (singleUrl) {
-      const res = await ingestOne(singleUrl);
-      return NextResponse.json(res);
-    }
-
-    return NextResponse.json({ ok: false, error: 'No URL provided' }, { status: 400 });
-  } catch (err: any) {
-    console.error('Ingest error:', err);
-    return NextResponse.json({ ok: false, error: String(err.message || err) }, { status: 500 });
+  } catch (error) {
+    console.error('❌ Ingest error:', error);
+    return NextResponse.json(
+      { ok: false, error: (error as Error).message },
+      { status: 500 }
+    );
   }
 }

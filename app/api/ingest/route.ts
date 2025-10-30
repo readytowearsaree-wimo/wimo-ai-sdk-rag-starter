@@ -1,5 +1,5 @@
 // app/api/ingest/route.ts
-export const runtime = 'node';
+export const runtime = 'nodejs';
 
 import { NextResponse } from 'next/server';
 import * as cheerio from 'cheerio';
@@ -8,7 +8,7 @@ import { v4 as uuidv4 } from 'uuid';
 import pkg from 'pg';
 const { Client } = pkg;
 
-// ─── helpers ───────────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────
 
 function chunkText(text: string, maxLen = 4000) {
   const chunks: string[] = [];
@@ -29,33 +29,27 @@ async function fetchHtmlAsText(url: string) {
   return text;
 }
 
-// parse a simple XML sitemap that has <url><loc>...</loc></url>
 async function fetchSitemapUrls(sitemapUrl: string): Promise<string[]> {
   const res = await fetch(sitemapUrl, { cache: 'no-store' });
   const xml = await res.text();
   const $ = cheerio.load(xml, { xmlMode: true });
 
-  // two cases:
-  // 1) sitemapindex -> sub-sitemaps
-  // 2) urlset -> actual pages
+  // handle sitemap index (links to sub-sitemaps)
   const sitemapLocs: string[] = [];
   $('sitemap > loc').each((_, el) => {
     sitemapLocs.push($(el).text().trim());
   });
+  if (sitemapLocs.length > 0) return sitemapLocs;
 
-  if (sitemapLocs.length > 0) {
-    // it's a sitemap index → return those sitemaps
-    return sitemapLocs;
-  }
-
-  // otherwise get page URLs
+  // handle URL set
   const pageUrls: string[] = [];
   $('url > loc').each((_, el) => {
     pageUrls.push($(el).text().trim());
   });
-
   return pageUrls;
 }
+
+// ─── Handlers ───────────────────────────────────────────────
 
 export async function GET() {
   return NextResponse.json({ ok: true, msg: 'ingest route is alive' });
@@ -63,25 +57,20 @@ export async function GET() {
 
 export async function POST(req: Request) {
   try {
-    // read body first
     const body = (await req.json().catch(() => ({}))) as any;
 
-    // ── secret check (must match Vercel env) ──
+    // Secret check
     const headerSecret = req.headers.get('x-ingest-secret');
     const expectedSecret = process.env.INGEST_SECRET;
     if (expectedSecret && headerSecret !== expectedSecret) {
       return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
     }
 
-    // allow several keys
     const sitemapUrl: string | undefined =
       body.sitemapUrl || body.sitemapurl || body.sitemap || body.siteMapUrl;
     const singleUrl: string | undefined = body.url;
-
-    // limit per run
     const maxUrls: number = typeof body.maxUrls === 'number' ? body.maxUrls : 20;
 
-    // envs
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const SUPABASE_CONN = process.env.SUPABASE_CONN;
     if (!OPENAI_API_KEY || !SUPABASE_CONN) {
@@ -95,29 +84,18 @@ export async function POST(req: Request) {
     const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
 
-    // ─────────────────────────────────────────
-    // 1) single-page ingestion
-    // ─────────────────────────────────────────
+    // ─── Single URL mode ────────────────────────
     if (singleUrl) {
       const result = await ingestOneUrl(singleUrl, openai, client);
       await client.end();
-      return NextResponse.json({
-        ok: true,
-        mode: 'single',
-        url: singleUrl,
-        ...result,
-      });
+      return NextResponse.json({ ok: true, mode: 'single', url: singleUrl, ...result });
     }
 
-    // ─────────────────────────────────────────
-    // 2) sitemap ingestion (with limit)
-    // ─────────────────────────────────────────
+    // ─── Sitemap mode ───────────────────────────
     if (sitemapUrl) {
-      // could be either a sitemap-index or a urlset
       const urls = await fetchSitemapUrls(sitemapUrl);
 
-      // if it returned sub-sitemaps (index), just return them
-      // the idea is: call this API again for EACH of those
+      // If it's a sitemap index, return the subsites
       if (urls.length && urls[0].endsWith('.xml')) {
         await client.end();
         return NextResponse.json({
@@ -125,23 +103,20 @@ export async function POST(req: Request) {
           mode: 'sitemap-index',
           sitemapUrl,
           subSitemaps: urls,
-          note: 'Call /api/ingest again with each of these',
+          note: 'Call again with one of these sitemap URLs',
         });
       }
 
-      // otherwise, we have actual page URLs
-      const slice = urls.slice(0, maxUrls);
+      // Otherwise it's a normal sitemap
+      const limited = urls.slice(0, maxUrls);
       const ingested: string[] = [];
       const failed: { url: string; error: string }[] = [];
 
-      for (const pageUrl of slice) {
+      for (const pageUrl of limited) {
         try {
           const r = await ingestOneUrl(pageUrl, openai, client);
-          if (r.ok) {
-            ingested.push(pageUrl);
-          } else {
-            failed.push({ url: pageUrl, error: r.error || 'unknown' });
-          }
+          if (r.ok) ingested.push(pageUrl);
+          else failed.push({ url: pageUrl, error: r.error || 'unknown' });
         } catch (e: any) {
           failed.push({ url: pageUrl, error: e?.message || String(e) });
         }
@@ -152,14 +127,13 @@ export async function POST(req: Request) {
         ok: true,
         mode: 'sitemap',
         sitemapUrl,
-        countInThisRun: slice.length,
+        countInThisRun: limited.length,
         ingested: ingested.length,
         failed,
-        moreAvailable: urls.length > slice.length,
+        moreAvailable: urls.length > limited.length,
       });
     }
 
-    // nothing provided
     await client.end();
     return NextResponse.json({ ok: false, error: 'No URL provided' }, { status: 400 });
   } catch (err: any) {
@@ -168,30 +142,21 @@ export async function POST(req: Request) {
   }
 }
 
-// ─── core ingestion for ONE url ────────────────────────────
-async function ingestOneUrl(
-  url: string,
-  openai: OpenAI,
-  client: any
-): Promise<{ ok: boolean; error?: string; chunks?: number }> {
-  // fetch text
+// ─── Core logic: ingest one page ───────────────────────────
+
+async function ingestOneUrl(url: string, openai: OpenAI, client: any) {
   const text = await fetchHtmlAsText(url);
-  if (!text) {
-    return { ok: false, error: 'No content extracted from URL' };
-  }
+  if (!text) return { ok: false, error: 'No content extracted' };
 
   const docId = uuidv4();
-
-  // insert / upsert document (no "meta" col now)
   await client.query(
-    `insert into documents (id, url, content)
-     values ($1, $2, $3)
-     on conflict (url) do update set content = excluded.content`,
+    `INSERT INTO documents (id, url, content)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (url) DO UPDATE SET content = excluded.content`,
     [docId, url, text]
   );
 
-  // remove old chunks
-  await client.query(`delete from document_chunks where document_id = $1`, [docId]);
+  await client.query(`DELETE FROM document_chunks WHERE document_id = $1`, [docId]);
 
   const chunks = chunkText(text);
   let idx = 0;
@@ -200,13 +165,11 @@ async function ingestOneUrl(
       model: 'text-embedding-3-small',
       input: chunk,
     });
-
     const vector = emb.data[0].embedding;
 
-    // IMPORTANT: pass as JSON array, Postgres will coerce to vector via extension
     await client.query(
-      `insert into document_chunks (id, document_id, chunk_index, content, embedding)
-       values ($1, $2, $3, $4, $5)`,
+      `INSERT INTO document_chunks (id, document_id, chunk_index, content, embedding)
+       VALUES ($1, $2, $3, $4, $5)`,
       [uuidv4(), docId, idx, chunk, vector]
     );
     idx++;

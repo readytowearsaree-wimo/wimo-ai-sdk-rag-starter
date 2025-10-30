@@ -38,9 +38,8 @@ export async function POST(req: Request) {
     const queryEmbedding = emb.data[0].embedding;
     const vecLiteral = `[${queryEmbedding.join(',')}]`;
 
-    // 2) fetch more than we finally need (to give FAQ a chance)
-    //    we'll re-rank in Node
-    const fetchCount = Math.max(topK * 3, 30); // gets 30 rows max
+    // 2) pull MORE rows than needed (to be able to pick only FAQs)
+    const fetchCount = Math.max(topK * 4, 40);
 
     const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
@@ -61,42 +60,59 @@ export async function POST(req: Request) {
     const { rows } = await client.query(sql, [vecLiteral, fetchCount]);
     await client.end();
 
-    // 3) re-rank with "FAQ first if comparable"
-    const results = rows
-      .map(r => {
-        const url: string = r.url || '';
-        const isFaq =
-          url.includes('/s/f/') ||
-          url.includes('/faqs-for-ready-to-wear-saree') ||
-          url.includes('/faq') ||
-          url.includes('/faqs');
+    // small helper: is this row from FAQ?
+    const mark = (url: string | null): boolean => {
+      if (!url) return false;
+      const u = url.toLowerCase();
+      return (
+        u.includes('/s/f/') ||
+        u.includes('/faq') ||
+        u.includes('/faqs-for-ready-to-wear-saree')
+      );
+    };
 
-        // base score from vector
-        const base = Number(r.similarity) || 0;
+    // 3) split
+    const faqRows = rows
+      .filter(r => mark(r.url))
+      .map(r => ({
+        document_id: r.document_id,
+        url: r.url,
+        chunk_index: r.chunk_index,
+        content: r.content,
+        similarity: Number(r.similarity) || 0,
+        sourceBucket: 'faq',
+      }))
+      .sort((a, b) => b.similarity - a.similarity);
 
-        // generic FAQ bonus: enough to win in a tie,
-        // but not enough to beat a clearly better non-FAQ match
-        const faqBonus = isFaq ? 0.25 : 0;
+    const otherRows = rows
+      .filter(r => !mark(r.url))
+      .map(r => ({
+        document_id: r.document_id,
+        url: r.url,
+        chunk_index: r.chunk_index,
+        content: r.content,
+        similarity: Number(r.similarity) || 0,
+        sourceBucket: 'other',
+      }))
+      .sort((a, b) => b.similarity - a.similarity);
 
-        return {
-          document_id: r.document_id,
-          url: r.url,
-          chunk_index: r.chunk_index,
-          content: r.content,
-          similarity: base,
-          boostedScore: base + faqBonus,
-          sourceBucket: isFaq ? 'faq' : 'other',
-        };
-      })
-      // sort by boosted score desc
-      .sort((a, b) => b.boostedScore - a.boostedScore)
-      // finally return only what user asked for
-      .slice(0, topK);
+    let finalResults;
+    if (faqRows.length > 0) {
+      // STRICT RULE: show FAQs first, then fill with others if not enough
+      finalResults = [...faqRows.slice(0, topK)];
+      if (finalResults.length < topK) {
+        const needed = topK - finalResults.length;
+        finalResults = finalResults.concat(otherRows.slice(0, needed));
+      }
+    } else {
+      // no faq found → just return the best matches
+      finalResults = [...otherRows.slice(0, topK)];
+    }
 
     return NextResponse.json({
       ok: true,
       query,
-      results,
+      results: finalResults,
     });
   } catch (err: any) {
     console.error('Search error:', err);

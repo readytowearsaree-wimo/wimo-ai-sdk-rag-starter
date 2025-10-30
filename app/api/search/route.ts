@@ -6,7 +6,6 @@ import pkg from 'pg';
 const { Client } = pkg;
 
 export async function GET() {
-  // simple health-check
   return NextResponse.json({ ok: true, msg: 'search route is alive' });
 }
 
@@ -17,15 +16,11 @@ export async function POST(req: Request) {
     const topK = Math.min(Math.max(Number(body?.topK ?? 5), 1), 20);
 
     if (!query) {
-      return NextResponse.json(
-        { ok: false, error: 'Missing "query" in body' },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: 'Missing "query"' }, { status: 400 });
     }
 
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const SUPABASE_CONN = process.env.SUPABASE_CONN;
-
     if (!OPENAI_API_KEY || !SUPABASE_CONN) {
       return NextResponse.json(
         { ok: false, error: 'Missing OPENAI_API_KEY or SUPABASE_CONN' },
@@ -40,14 +35,15 @@ export async function POST(req: Request) {
       model: 'text-embedding-3-small',
       input: query,
     });
-    const queryEmbedding = emb.data[0].embedding;
+    const queryEmbedding = emb.data[0].embedding; // number[]
 
-    // 2) Query pgvector for nearest chunks
+    // Convert to pgvector literal string: "[0.1,0.2,...]"
+    const vecLiteral = `[${queryEmbedding.join(',')}]`;
+
+    // 2) Query pgvector
     const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
 
-    // cosine distance operator for pgvector is `<=>`
-    // similarity = 1 - cosine_distance
     const sql = `
       select
         dc.document_id,
@@ -60,8 +56,8 @@ export async function POST(req: Request) {
       order by dc.embedding <=> $1::vector
       limit $2;
     `;
-    const { rows } = await client.query(sql, [queryEmbedding, topK]);
 
+    const { rows } = await client.query(sql, [vecLiteral, topK]);
     await client.end();
 
     return NextResponse.json({
@@ -77,9 +73,6 @@ export async function POST(req: Request) {
     });
   } catch (err: any) {
     console.error('Search error:', err);
-    return NextResponse.json(
-      { ok: false, error: String(err?.message || err) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: String(err?.message || err) }, { status: 500 });
   }
 }

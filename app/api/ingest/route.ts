@@ -6,6 +6,7 @@ import * as cheerio from 'cheerio';
 import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
 import pkg from 'pg';
+
 const { Client } = pkg;
 
 // split long text into chunks
@@ -19,7 +20,6 @@ function chunkText(text: string, maxLen = 4000) {
   return chunks;
 }
 
-// fetch html → clean text
 async function fetchHtmlAsText(url: string) {
   const res = await fetch(url, { cache: 'no-store' });
   const html = await res.text();
@@ -29,29 +29,32 @@ async function fetchHtmlAsText(url: string) {
   return text;
 }
 
-// simple GET healthcheck
+// health check
 export async function GET() {
-  return NextResponse.json({ ok: true, msg: 'ingest route is alive' });
+  return NextResponse.json({
+    ok: true,
+    msg: 'ingest route is alive',
+    hasDb: !!process.env.SUPABASE_CONN,
+  });
 }
 
-// single-url ingest
 export async function POST(req: Request) {
   try {
-    // 1) secret check
-    const headerSecret = req.headers.get('x-ingest-secret');
+    // 1) auth header (optional but you were using it)
     const expectedSecret = process.env.INGEST_SECRET;
-    if (expectedSecret && headerSecret !== expectedSecret) {
-      return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
+    if (expectedSecret) {
+      const got = req.headers.get('x-ingest-secret');
+      if (got !== expectedSecret) {
+        return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
+      }
     }
 
-    // 2) body
     const body = (await req.json().catch(() => ({}))) as any;
-    const url: string | undefined = body.url;
+    const url = body.url;
     if (!url) {
       return NextResponse.json({ ok: false, error: 'No URL provided' }, { status: 400 });
     }
 
-    // 3) env
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const SUPABASE_CONN = process.env.SUPABASE_CONN;
     if (!OPENAI_API_KEY || !SUPABASE_CONN) {
@@ -61,36 +64,35 @@ export async function POST(req: Request) {
       );
     }
 
-    // 4) clients
-    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-    const client = new Client({
-      connectionString: SUPABASE_CONN,
-      ssl: { rejectUnauthorized: false }, // for Supabase on Vercel
-    });
+    // 2) connect
+    const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
 
-    // 5) fetch page
+    // 3) fetch page
     const text = await fetchHtmlAsText(url);
     if (!text) {
       await client.end();
-      return NextResponse.json({ ok: false, error: 'No content extracted from URL' });
+      return NextResponse.json({ ok: false, error: 'Could not extract text' }, { status: 400 });
     }
 
-    // 6) upsert into documents (no meta column)
+    // 4) insert / upsert document
     const docId = uuidv4();
     await client.query(
-      `INSERT INTO documents (id, url, content)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (url) DO UPDATE SET content = excluded.content`,
+      `
+      INSERT INTO documents (id, url, content)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (url) DO UPDATE SET content = EXCLUDED.content
+      `,
       [docId, url, text]
     );
 
-    // 7) delete old chunks for this doc
+    // 5) delete old chunks for this doc (we're re-ingesting)
     await client.query(`DELETE FROM document_chunks WHERE document_id = $1`, [docId]);
 
-    // 8) make chunks and embed
+    // 6) chunk + embed + insert
+    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
     const chunks = chunkText(text);
-    let stored = 0;
+
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
 
@@ -99,27 +101,29 @@ export async function POST(req: Request) {
         input: chunk,
       });
 
-      const vector = emb.data[0].embedding;
+      const vector = emb.data[0].embedding; // JS number[]
+      // 👇 turn JS array into pgvector text: [0.1,0.2,...]
+      const vecStr = `[${vector.join(',')}]`;
 
       await client.query(
-        `INSERT INTO document_chunks (id, document_id, chunk_index, content, embedding)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [uuidv4(), docId, i, chunk, vector]
+        `
+        INSERT INTO document_chunks (id, document_id, chunk_index, content, embedding)
+        VALUES ($1, $2, $3, $4, $5::vector)
+        `,
+        [uuidv4(), docId, i, chunk, vecStr]
       );
-      stored++;
     }
 
     await client.end();
 
     return NextResponse.json({
       ok: true,
-      message: 'Ingestion complete',
+      mode: 'single',
       url,
       chunks: chunks.length,
-      stored,
     });
   } catch (err: any) {
-    console.error('Ingest error:', err);
-    return NextResponse.json({ ok: false, error: err?.message || String(err) }, { status: 500 });
+    console.error('ingest error:', err);
+    return NextResponse.json({ ok: false, error: String(err.message || err) }, { status: 500 });
   }
 }

@@ -6,9 +6,10 @@ import * as cheerio from 'cheerio';
 import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
 import pkg from 'pg';
+
 const { Client } = pkg;
 
-// split big text
+// split a big text into chunks
 function chunkText(text: string, maxLen = 4000) {
   const chunks: string[] = [];
   let i = 0;
@@ -19,8 +20,12 @@ function chunkText(text: string, maxLen = 4000) {
   return chunks;
 }
 
+// fetch HTML → clean → text
 async function fetchHtmlAsText(url: string) {
   const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) {
+    throw new Error(`fetch failed for ${url}: ${res.status}`);
+  }
   const html = await res.text();
   const $ = cheerio.load(html);
   $('script,style,noscript,nav,footer').remove();
@@ -28,29 +33,55 @@ async function fetchHtmlAsText(url: string) {
   return text;
 }
 
-// GET = healthcheck
+// fetch and parse sitemap.xml → list of URLs
+async function fetchSitemapUrls(sitemapUrl: string): Promise<string[]> {
+  const res = await fetch(sitemapUrl, { cache: 'no-store' });
+  if (!res.ok) {
+    throw new Error(`sitemap fetch failed: ${res.status}`);
+  }
+  const xml = await res.text();
+  const $ = cheerio.load(xml, { xmlMode: true });
+
+  const urls: string[] = [];
+  $('url > loc').each((i, el) => {
+    const loc = $(el).text().trim();
+    if (loc) urls.push(loc);
+  });
+
+  // some sites use sitemapindex → sitemap -> loc
+  if (urls.length === 0) {
+    const indexUrls: string[] = [];
+    $('sitemap > loc').each((i, el) => {
+      const loc = $(el).text().trim();
+      if (loc) indexUrls.push(loc);
+    });
+    // if you have sitemap index, we could fetch each again — but for now just return what we found
+    return indexUrls;
+  }
+
+  return urls;
+}
+
+// GET – health check
 export async function GET() {
   return NextResponse.json({ ok: true, msg: 'ingest route is alive' });
 }
 
-// POST = single page or sitemap
+// POST – ingest single URL or full sitemap
 export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({} as any));
+    const body = (await req.json().catch(() => ({}))) as any;
 
-    // accept multiple spellings
+    // accept multiple keys
     const sitemapUrl =
       body.sitemapUrl || body.sitemapurl || body.sitemap || body.siteMapUrl;
     const singleUrl = body.url;
 
-    // small debug to Vercel logs
-    console.log('INGEST BODY RECEIVED:', body);
-
-    if (!sitemapUrl && !singleUrl) {
-      return NextResponse.json(
-        { ok: false, error: 'No URL provided' },
-        { status: 400 }
-      );
+    // simple secret check (same as your curl header)
+    const secretHeader = req.headers.get('x-ingest-secret');
+    const expectedSecret = process.env.INGEST_SECRET;
+    if (expectedSecret && secretHeader !== expectedSecret) {
+      return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
     }
 
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -62,160 +93,92 @@ export async function POST(req: Request) {
       );
     }
 
-    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-    const client = new Client({ connectionString: SUPABASE_CONN });
-    await client.connect();
+    // helper to ingest ONE page
+    const ingestOne = async (pageUrl: string) => {
+      const client = new Client({ connectionString: SUPABASE_CONN });
+      await client.connect();
 
-    // ensure table shape
-    await client.query(`
-      create table if not exists documents (
-        id uuid primary key,
-        url text unique,
-        content text,
-        created_at timestamptz default now()
-      );
-    `);
-    await client.query(`
-      create table if not exists document_chunks (
-        id uuid primary key,
-        document_id uuid references documents(id) on delete cascade,
-        chunk_index int,
-        content text,
-        embedding vector(1536)
-      );
-    `);
-
-    // ------------- SITEMAP PATH -------------
-    if (sitemapUrl) {
-      const sitemapRes = await fetch(sitemapUrl);
-      const sitemapXml = await sitemapRes.text();
-
-      // very simple sitemap parser
-      const urls: string[] = [];
-      const $ = cheerio.load(sitemapXml, { xmlMode: true });
-      $('url > loc').each((_, el) => {
-        const u = $(el).text().trim();
-        if (u) urls.push(u);
-      });
-
-      let okCount = 0;
-      let failCount = 0;
-
-      for (const pageUrl of urls) {
-        try {
-          const text = await fetchHtmlAsText(pageUrl);
-          if (!text) continue;
-
-          const docId = uuidv4();
-          // insert or update
-          const upsertResult = await client.query(
-            `
-              insert into documents (id, url, content)
-              values ($1, $2, $3)
-              on conflict (url) do update set content = excluded.content
-              returning id;
-            `,
-            [docId, pageUrl, text]
-          );
-
-          const finalDocId = upsertResult.rows[0]?.id || docId;
-
-          // delete old chunks
-          await client.query(
-            `delete from document_chunks where document_id = $1`,
-            [finalDocId]
-          );
-
-          const chunks = chunkText(text);
-          for (let i = 0; i < chunks.length; i++) {
-            const emb = await openai.embeddings.create({
-              model: 'text-embedding-3-small',
-              input: chunks[i],
-            });
-            const vector = emb.data[0].embedding;
-
-            await client.query(
-              `
-                insert into document_chunks
-                  (id, document_id, chunk_index, content, embedding)
-                values ($1, $2, $3, $4, $5)
-              `,
-              [uuidv4(), finalDocId, i, chunks[i], vector]
-            );
-          }
-
-          okCount++;
-        } catch (e) {
-          console.error('Failed to ingest page from sitemap:', pageUrl, e);
-          failCount++;
-        }
+      const text = await fetchHtmlAsText(pageUrl);
+      if (!text) {
+        await client.end();
+        return { ok: false, error: 'no text', url: pageUrl };
       }
 
-      await client.end();
-      return NextResponse.json({
-        ok: true,
-        mode: 'sitemap',
-        sitemapUrl,
-        ingested: okCount,
-        failed: failCount,
-      });
-    }
-
-    // ------------- SINGLE URL PATH -------------
-    if (singleUrl) {
-      const text = await fetchHtmlAsText(singleUrl);
-
+      // insert into documents first (no meta column in your DB)
       const docId = uuidv4();
-      const upsertResult = await client.query(
-        `
-          insert into documents (id, url, content)
-          values ($1, $2, $3)
-          on conflict (url) do update set content = excluded.content
-          returning id;
-        `,
-        [docId, singleUrl, text]
-      );
-      const finalDocId = upsertResult.rows[0]?.id || docId;
-
       await client.query(
-        `delete from document_chunks where document_id = $1`,
-        [finalDocId]
+        `
+        insert into documents (id, url, content)
+        values ($1, $2, $3)
+        on conflict (url) do update set content = excluded.content
+        `,
+        [docId, pageUrl, text]
       );
+
+      // delete old chunks for this doc
+      await client.query('delete from document_chunks where document_id = $1', [docId]);
+
+      const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
       const chunks = chunkText(text);
       for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
         const emb = await openai.embeddings.create({
           model: 'text-embedding-3-small',
-          input: chunks[i],
+          input: chunk,
         });
+
         const vector = emb.data[0].embedding;
+
+        // IMPORTANT: cast array → vector in SQL
         await client.query(
           `
-            insert into document_chunks
-              (id, document_id, chunk_index, content, embedding)
-            values ($1, $2, $3, $4, $5)
+          insert into document_chunks (id, document_id, chunk_index, content, embedding)
+          values ($1, $2, $3, $4, $5::vector)
           `,
-          [uuidv4(), finalDocId, i, chunks[i], vector]
+          [uuidv4(), docId, i, chunk, JSON.stringify(vector)]
         );
       }
 
       await client.end();
+      return { ok: true, url: pageUrl, chunks: chunks.length };
+    };
+
+    // CASE 1: sitemap
+    if (sitemapUrl) {
+      const urls = await fetchSitemapUrls(sitemapUrl);
+      let ingested = 0;
+      let failed = 0;
+
+      // keep it serial for now (simpler, less Supabase load)
+      for (const u of urls) {
+        try {
+          await ingestOne(u);
+          ingested++;
+        } catch (err) {
+          console.error('ingest failed for', u, err);
+          failed++;
+        }
+      }
+
       return NextResponse.json({
         ok: true,
-        mode: 'single',
-        url: singleUrl,
-        chunks: chunks.length,
+        mode: 'sitemap',
+        sitemapUrl,
+        ingested,
+        failed,
       });
     }
 
-    // fallback
-    await client.end();
-    return NextResponse.json({ ok: false, error: 'nothing ingested' });
+    // CASE 2: single url
+    if (singleUrl) {
+      const res = await ingestOne(singleUrl);
+      return NextResponse.json(res);
+    }
+
+    return NextResponse.json({ ok: false, error: 'No URL provided' }, { status: 400 });
   } catch (err: any) {
-    console.error('INGEST ERROR', err);
-    return NextResponse.json(
-      { ok: false, error: err.message || String(err) },
-      { status: 500 }
-    );
+    console.error('Ingest error:', err);
+    return NextResponse.json({ ok: false, error: String(err.message || err) }, { status: 500 });
   }
 }

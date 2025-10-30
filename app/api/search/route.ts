@@ -102,38 +102,116 @@ export async function POST(req: Request) {
     // 3) re-rank in code according to your priority:
     //    faq > product > policy > other
     const reranked = rows
-      .map((r) => {
-        const url: string = r.url ?? '';
-        const bucket = classifyUrl(url);
-        const baseScore = Number(r.similarity) || 0;
+  .map((r) => {
+    const url: string = r.url ?? '';
+    const content: string = r.content ?? '';
+    const baseScore = Number(r.similarity) || 0;
 
-        // BOOSTS: tune here
-        let boostedScore = baseScore;
-        switch (bucket) {
-          case 'faq':
-            boostedScore += 0.30; // biggest boost
-            break;
-          case 'product':
-            boostedScore += 0.15;
-            break;
-          case 'policy':
-            boostedScore += 0.05;
-            break;
-          default:
-            // 'other' -> no boost
-            break;
-        }
+    // 1) URL-based bucket
+    let bucket = classifyUrl(url);
 
-        return {
-          bucket,
-          boostedScore,
-          document_id: r.document_id,
-          url,
-          chunk_index: r.chunk_index,
-          content: r.content,
-          original_similarity: baseScore,
-        };
-      })
+    // 2) content-based override for FAQ
+    // if the content itself looks like a Q&A, treat it as FAQ even if URL is ugly
+    const lowerContent = content.toLowerCase();
+    const looksLikeFaq =
+      lowerContent.startsWith('q:') ||
+      lowerContent.includes('question:') ||
+      lowerContent.includes('answer:') ||
+      lowerContent.includes('ready to wear saree') && lowerContent.includes('how') ||
+      lowerContent.includes('can i ') ||
+      lowerContent.includes('do you ') ||
+      lowerContent.includes('what is ') ||
+      lowerContent.includes('how do i ');
+
+    if (looksLikeFaq && bucket === 'other') {
+      bucket = 'faq';
+    }
+
+    let boosted = baseScore;
+
+    // site-wide priority
+    switch (bucket) {
+      case 'faq':
+        boosted += 0.30;
+        break;
+      case 'product':
+        boosted += 0.15;
+        break;
+      case 'policy':
+        boosted += 0.05;
+        break;
+    }
+
+    // ---- query-aware boosts ----
+    // we already computed these above:
+    // const { wantsShipping, wantsCOD, wantsReturn } = detectIntent(query);
+
+    const u = url.toLowerCase();
+
+    // shipping: by URL OR by content
+    if (wantsShipping) {
+      const contentSaysShipping =
+        lowerContent.includes('ship') ||
+        lowerContent.includes('shipping') ||
+        lowerContent.includes('international') ||
+        lowerContent.includes('deliver');
+
+      if (
+        u.includes('/shipping') ||
+        u.includes('/s/f/do-you-ship') ||
+        u.includes('international') ||
+        contentSaysShipping
+      ) {
+        boosted += 0.35;
+      }
+    }
+
+    // COD: by URL OR content
+    if (wantsCOD) {
+      const contentSaysCOD =
+        lowerContent.includes('cod') ||
+        lowerContent.includes('cash on delivery');
+      if (
+        u.includes('cod') ||
+        u.includes('cash-on-delivery') ||
+        u.includes('/s/f/do-you-offer-cash-on') ||
+        contentSaysCOD
+      ) {
+        boosted += 0.35;
+      }
+    }
+
+    // return/refund: by URL OR content
+    if (wantsReturn) {
+      const contentSaysReturn =
+        lowerContent.includes('return') ||
+        lowerContent.includes('refund') ||
+        lowerContent.includes('exchange');
+      if (
+        u.includes('/return') ||
+        u.includes('/cancellation') ||
+        u.includes('/refund') ||
+        u.includes('/s/f/what-s-the-return') ||
+        u.includes('/s/f/what-is-your-returns') ||
+        contentSaysReturn
+      ) {
+        boosted += 0.35;
+      }
+    }
+
+    return {
+      bucket,
+      boostedScore: boosted,
+      document_id: r.document_id,
+      url,
+      chunk_index: r.chunk_index,
+      content: r.content,
+      original_similarity: baseScore,
+    };
+  })
+  .sort((a, b) => b.boostedScore - a.boostedScore)
+  .slice(0, topK);
+
       // sort by boosted score desc
       .sort((a, b) => b.boostedScore - a.boostedScore)
       // return only what the user asked for

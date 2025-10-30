@@ -88,7 +88,11 @@ export async function POST(req: Request) {
     if (singleUrl) {
       const result = await ingestOneUrl(singleUrl, openai, client);
       await client.end();
-      return NextResponse.json({ ok: true, mode: 'single', url: singleUrl, ...result });
+      return NextResponse.json({
+        mode: 'single',
+        url: singleUrl,
+        ...result,
+      });
     }
 
     // ─── Sitemap mode ───────────────────────────

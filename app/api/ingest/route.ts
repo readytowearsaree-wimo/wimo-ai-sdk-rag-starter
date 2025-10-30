@@ -9,7 +9,7 @@ import pkg from 'pg';
 
 const { Client } = pkg;
 
-// split a big text into chunks
+// split text
 function chunkText(text: string, maxLen = 4000) {
   const chunks: string[] = [];
   let i = 0;
@@ -20,7 +20,7 @@ function chunkText(text: string, maxLen = 4000) {
   return chunks;
 }
 
-// fetch HTML → clean → text
+// fetch HTML → text
 async function fetchHtmlAsText(url: string) {
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) {
@@ -33,8 +33,12 @@ async function fetchHtmlAsText(url: string) {
   return text;
 }
 
-// fetch and parse sitemap.xml → list of URLs
-async function fetchSitemapUrls(sitemapUrl: string): Promise<string[]> {
+/**
+ * Fetch a sitemap URL.
+ * - If it is a normal urlset → return that list
+ * - If it is a sitemapindex → fetch each child sitemap and aggregate all urls
+ */
+async function fetchSitemapUrlsDeep(sitemapUrl: string): Promise<string[]> {
   const res = await fetch(sitemapUrl, { cache: 'no-store' });
   if (!res.ok) {
     throw new Error(`sitemap fetch failed: ${res.status}`);
@@ -42,42 +46,56 @@ async function fetchSitemapUrls(sitemapUrl: string): Promise<string[]> {
   const xml = await res.text();
   const $ = cheerio.load(xml, { xmlMode: true });
 
-  const urls: string[] = [];
+  // 1) try normal <urlset>
+  const pageUrls: string[] = [];
   $('url > loc').each((i, el) => {
     const loc = $(el).text().trim();
-    if (loc) urls.push(loc);
+    if (loc) pageUrls.push(loc);
   });
-
-  // some sites use sitemapindex → sitemap -> loc
-  if (urls.length === 0) {
-    const indexUrls: string[] = [];
-    $('sitemap > loc').each((i, el) => {
-      const loc = $(el).text().trim();
-      if (loc) indexUrls.push(loc);
-    });
-    // if you have sitemap index, we could fetch each again — but for now just return what we found
-    return indexUrls;
+  if (pageUrls.length > 0) {
+    return pageUrls;
   }
 
-  return urls;
+  // 2) if no <url>, maybe it's a sitemapindex → collect child sitemaps
+  const sitemapUrls: string[] = [];
+  $('sitemap > loc').each((i, el) => {
+    const loc = $(el).text().trim();
+    if (loc) sitemapUrls.push(loc);
+  });
+
+  if (sitemapUrls.length === 0) {
+    // nothing we can do
+    return [];
+  }
+
+  // 3) fetch each child sitemap and collect their urls
+  const all: string[] = [];
+  for (const child of sitemapUrls) {
+    try {
+      const childUrls = await fetchSitemapUrlsDeep(child);
+      all.push(...childUrls);
+    } catch (err) {
+      console.error('child sitemap failed', child, err);
+    }
+  }
+  return all;
 }
 
-// GET – health check
+// simple GET
 export async function GET() {
   return NextResponse.json({ ok: true, msg: 'ingest route is alive' });
 }
 
-// POST – ingest single URL or full sitemap
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as any;
 
-    // accept multiple keys
+    // allow several keys
     const sitemapUrl =
       body.sitemapUrl || body.sitemapurl || body.sitemap || body.siteMapUrl;
     const singleUrl = body.url;
 
-    // simple secret check (same as your curl header)
+    // secret check
     const secretHeader = req.headers.get('x-ingest-secret');
     const expectedSecret = process.env.INGEST_SECRET;
     if (expectedSecret && secretHeader !== expectedSecret) {
@@ -93,7 +111,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // helper to ingest ONE page
+    // helper: ingest ONE page
     const ingestOne = async (pageUrl: string) => {
       const client = new Client({ connectionString: SUPABASE_CONN });
       await client.connect();
@@ -104,8 +122,9 @@ export async function POST(req: Request) {
         return { ok: false, error: 'no text', url: pageUrl };
       }
 
-      // insert into documents first (no meta column in your DB)
       const docId = uuidv4();
+
+      // your documents table has NO "meta" column, so just id/url/content
       await client.query(
         `
         insert into documents (id, url, content)
@@ -115,22 +134,19 @@ export async function POST(req: Request) {
         [docId, pageUrl, text]
       );
 
-      // delete old chunks for this doc
       await client.query('delete from document_chunks where document_id = $1', [docId]);
 
       const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
       const chunks = chunkText(text);
+
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
         const emb = await openai.embeddings.create({
           model: 'text-embedding-3-small',
           input: chunk,
         });
-
         const vector = emb.data[0].embedding;
 
-        // IMPORTANT: cast array → vector in SQL
         await client.query(
           `
           insert into document_chunks (id, document_id, chunk_index, content, embedding)
@@ -144,14 +160,15 @@ export async function POST(req: Request) {
       return { ok: true, url: pageUrl, chunks: chunks.length };
     };
 
-    // CASE 1: sitemap
+    // --------------- SITEMAP MODE ---------------
     if (sitemapUrl) {
-      const urls = await fetchSitemapUrls(sitemapUrl);
+      const allUrls = await fetchSitemapUrlsDeep(sitemapUrl);
+
       let ingested = 0;
       let failed = 0;
 
-      // keep it serial for now (simpler, less Supabase load)
-      for (const u of urls) {
+      // do sequential first (safe for your small Supabase)
+      for (const u of allUrls) {
         try {
           await ingestOne(u);
           ingested++;
@@ -165,12 +182,13 @@ export async function POST(req: Request) {
         ok: true,
         mode: 'sitemap',
         sitemapUrl,
+        found: allUrls.length,
         ingested,
         failed,
       });
     }
 
-    // CASE 2: single url
+    // --------------- SINGLE URL MODE ---------------
     if (singleUrl) {
       const res = await ingestOne(singleUrl);
       return NextResponse.json(res);

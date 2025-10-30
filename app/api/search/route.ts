@@ -16,10 +16,7 @@ export async function POST(req: Request) {
     const topK = Math.min(Math.max(Number(body?.topK ?? 5), 1), 20);
 
     if (!query) {
-      return NextResponse.json(
-        { ok: false, error: 'Missing "query"' },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: 'Missing "query"' }, { status: 400 });
     }
 
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -31,8 +28,9 @@ export async function POST(req: Request) {
       );
     }
 
-    // 1) embed query
     const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+    // 1) embed user query
     const emb = await openai.embeddings.create({
       model: 'text-embedding-3-small',
       input: query,
@@ -40,12 +38,12 @@ export async function POST(req: Request) {
     const queryEmbedding = emb.data[0].embedding;
     const vecLiteral = `[${queryEmbedding.join(',')}]`;
 
-    // 2) fetch from pg
+    // 2) fetch more than we finally need (to give FAQ a chance)
+    //    we'll re-rank in Node
+    const fetchCount = Math.max(topK * 3, 30); // gets 30 rows max
+
     const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
-
-    // pull MORE than we need so we can re-rank in JS
-    const candidateLimit = Math.max(topK * 4, 20);
 
     const sql = `
       select
@@ -60,68 +58,48 @@ export async function POST(req: Request) {
       limit $2;
     `;
 
-    const { rows } = await client.query(sql, [vecLiteral, candidateLimit]);
+    const { rows } = await client.query(sql, [vecLiteral, fetchCount]);
     await client.end();
 
-    // 3) JS re-rank with buckets
-    // priority:
-    // 1. FAQ pages       -> +0.30
-    // 2. Product pages   -> +0.15
-    // 3. Policy pages    -> +0.05
-    // else               -> 0
-    const reranked = rows
-      .map((r: any) => {
-        const url: string = r.url ?? '';
-        let boost = 0;
-
+    // 3) re-rank with "FAQ first if comparable"
+    const results = rows
+      .map(r => {
+        const url: string = r.url || '';
         const isFaq =
-          url.includes('/faqs') ||
           url.includes('/s/f/') ||
-          url.includes('/faq');
-        const isProduct =
-          url.includes('/products/') ||
-          url.includes('/category/');
-        const isPolicy =
-          url.includes('/shipping') ||
-          url.includes('/return') ||
-          url.includes('/cancellation');
+          url.includes('/faqs-for-ready-to-wear-saree') ||
+          url.includes('/faq') ||
+          url.includes('/faqs');
 
-        if (isFaq) {
-          boost = 0.30;
-        } else if (isProduct) {
-          boost = 0.15;
-        } else if (isPolicy) {
-          boost = 0.05;
-        }
+        // base score from vector
+        const base = Number(r.similarity) || 0;
 
-        const baseSim = Number(r.similarity);
-        const boostedScore = baseSim + boost;
+        // generic FAQ bonus: enough to win in a tie,
+        // but not enough to beat a clearly better non-FAQ match
+        const faqBonus = isFaq ? 0.25 : 0;
 
         return {
           document_id: r.document_id,
-          url,
+          url: r.url,
           chunk_index: r.chunk_index,
           content: r.content,
-          similarity: baseSim,
-          boost,
-          boostedScore,
+          similarity: base,
+          boostedScore: base + faqBonus,
+          sourceBucket: isFaq ? 'faq' : 'other',
         };
       })
-      // sort by boosted score first
+      // sort by boosted score desc
       .sort((a, b) => b.boostedScore - a.boostedScore)
-      // then take what user asked for
+      // finally return only what user asked for
       .slice(0, topK);
 
     return NextResponse.json({
       ok: true,
       query,
-      results: reranked,
+      results,
     });
   } catch (err: any) {
     console.error('Search error:', err);
-    return NextResponse.json(
-      { ok: false, error: String(err?.message || err) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: String(err?.message || err) }, { status: 500 });
   }
 }

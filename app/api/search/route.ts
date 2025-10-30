@@ -5,17 +5,10 @@ import pkg from 'pg';
 
 const { Client } = pkg;
 
-// helper: assign weights based on URL patterns
-function pagePriority(url: string) {
-  if (!url) return 0;
-  const u = url.toLowerCase();
-
-  // FAQ first, then Product, then Policy
-  if (u.includes('faq')) return 3;
-  if (u.includes('/products/') || u.includes('stitch')) return 2;
-  if (u.includes('policy') || u.includes('terms')) return 1;
-  return 0;
-}
+// put your FAQ url(s) here
+const FAQ_URLS = [
+  'https://www.readytowearsaree.com/faqs-for-ready-to-wear-saree',
+];
 
 export async function GET() {
   return NextResponse.json({ ok: true, msg: 'search route is alive' });
@@ -25,7 +18,9 @@ export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
     const query = (body?.query ?? '').toString().trim();
-    const topK = Math.min(Math.max(Number(body?.topK ?? 5), 1), 20);
+    // user asked for 5, but we’ll pull more from DB and re-rank
+    const userTopK = Math.min(Math.max(Number(body?.topK ?? 5), 1), 20);
+    const dbTopK = Math.max(userTopK, 20); // fetch more to re-rank
 
     if (!query) {
       return NextResponse.json({ ok: false, error: 'Missing "query"' }, { status: 400 });
@@ -42,7 +37,7 @@ export async function POST(req: Request) {
 
     const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-    // 1️⃣ Embed the user query
+    // 1) embed query
     const emb = await openai.embeddings.create({
       model: 'text-embedding-3-small',
       input: query,
@@ -50,7 +45,7 @@ export async function POST(req: Request) {
     const queryEmbedding = emb.data[0].embedding;
     const vecLiteral = `[${queryEmbedding.join(',')}]`;
 
-    // 2️⃣ Run vector similarity search in Supabase
+    // 2) query pg
     const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
 
@@ -66,27 +61,44 @@ export async function POST(req: Request) {
       order by dc.embedding <=> $1::vector
       limit $2;
     `;
-
-    const { rows } = await client.query(sql, [vecLiteral, topK]);
+    const { rows } = await client.query(sql, [vecLiteral, dbTopK]);
     await client.end();
 
-    // 3️⃣ Apply priority boosting based on URL
+    // 3) re-rank in JS
     const boosted = rows
-      .map((r) => {
-        const base = Number(r.similarity) || 0;
-        const bonus = pagePriority(r.url) * 0.05; // boost size: 0.05 per tier
+      .map((r: any) => {
+        let boost = 1.0;
+
+        const url: string = r.url || '';
+
+        // boost FAQ page
+        if (FAQ_URLS.some(f => url.startsWith(f))) {
+          boost *= 1.4; // play with this value
+        }
+
+        // de-prioritize policy pages a bit
+        if (
+          url.includes('/shipping') ||
+          url.includes('/polic') || // shipping-policy, cancellation-policy
+          url.includes('/cancellation')
+        ) {
+          boost *= 0.9;
+        }
+
         return {
           document_id: r.document_id,
-          url: r.url,
+          url: url,
           chunk_index: r.chunk_index,
           content: r.content,
-          similarity: base,
-          boostedScore: base + bonus,
+          similarity: Number(r.similarity) * boost,
+          _rawSim: Number(r.similarity),
         };
       })
-      .sort((a, b) => b.boostedScore - a.boostedScore);
+      // sort by boosted similarity DESC
+      .sort((a, b) => b.similarity - a.similarity)
+      // finally trim to what user asked
+      .slice(0, userTopK);
 
-    // 4️⃣ Return the re-ranked results
     return NextResponse.json({
       ok: true,
       query,

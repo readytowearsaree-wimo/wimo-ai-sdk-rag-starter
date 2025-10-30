@@ -89,6 +89,26 @@ export async function GET() {
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as any;
+    // Secret check (ensure this happens before anything else)
+    const secretHeader = req.headers.get('x-ingest-secret');
+    const expectedSecret = process.env.INGEST_SECRET;
+
+    console.log('🔒 Incoming secret:', secretHeader);
+    console.log('🔑 Expected secret:', expectedSecret);
+
+    if (!expectedSecret) {
+      console.error('Missing INGEST_SECRET in environment');
+      return NextResponse.json(
+        { ok: false, error: 'missing server secret' },
+        { status: 500 }
+      );
+    }
+
+    if (secretHeader !== expectedSecret) {
+      console.error('Secret mismatch');
+      return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
+    }
+
 
     // allow several keys
     const sitemapUrl =

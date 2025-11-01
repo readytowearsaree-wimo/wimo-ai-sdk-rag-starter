@@ -5,73 +5,56 @@ import pkg from 'pg';
 
 const { Client } = pkg;
 
-// allow your site + preview; if you want *, put '*'
-const ALLOWED_ORIGINS = [
-  'https://www.readytowearsaree.com',
-  'https://readytowearsaree.com',
-  'https://editor.wix.com',       // wix editor
-  'https://manage.wix.com'        // wix preview
-];
+// 1) CORS helper
+const ALLOWED_ORIGIN = 'https://www.readytowearsaree.com';
 
-function cors(res: any, origin: string | null) {
-  const headers: Record<string, string> = {
-    'Access-Control-Allow-Credentials': 'true',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
-  };
-  // if you want to be lazy: headers['Access-Control-Allow-Origin'] = '*'
-  headers['Access-Control-Allow-Origin'] =
-    origin && ALLOWED_ORIGINS.includes(origin) ? origin : '*';
-  for (const [k, v] of Object.entries(headers)) {
-    res.headers.set(k, v);
-  }
+function cors(res: NextResponse) {
+  res.headers.set('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.headers.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.headers.set('Access-Control-Max-Age', '86400');
   return res;
 }
 
-export async function OPTIONS(req: Request) {
-  const origin = req.headers.get('origin');
-  const res = new NextResponse(null, { status: 204 });
-  return cors(res, origin);
+// 2) handle preflight
+export async function OPTIONS() {
+  return cors(new NextResponse(null, { status: 204 }));
 }
 
-export async function GET(req: Request) {
-  const origin = req.headers.get('origin');
-  const res = NextResponse.json({ ok: true, msg: 'search route is alive' });
-  return cors(res, origin);
+// simple ping
+export async function GET() {
+  return cors(NextResponse.json({ ok: true, msg: 'search route alive' }));
 }
 
 export async function POST(req: Request) {
-  const origin = req.headers.get('origin');
-
   try {
     const body = await req.json().catch(() => ({}));
     const query = (body?.query ?? '').toString().trim();
     const topK = Math.min(Math.max(Number(body?.topK ?? 5), 1), 20);
 
     if (!query) {
-      const res = NextResponse.json(
-        { ok: false, error: 'Missing "query"' },
-        { status: 400 }
+      return cors(
+        NextResponse.json({ ok: false, error: 'Missing "query"' }, { status: 400 })
       );
-      return cors(res, origin);
     }
 
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const SUPABASE_CONN = process.env.SUPABASE_CONN;
     if (!OPENAI_API_KEY || !SUPABASE_CONN) {
-      const res = NextResponse.json(
-        { ok: false, error: 'Missing OPENAI_API_KEY or SUPABASE_CONN' },
-        { status: 500 }
+      return cors(
+        NextResponse.json(
+          { ok: false, error: 'Missing OPENAI_API_KEY or SUPABASE_CONN' },
+          { status: 500 }
+        )
       );
-      return cors(res, origin);
     }
 
     const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-    // embed user query
+    // make embedding
     const emb = await openai.embeddings.create({
       model: 'text-embedding-3-small',
-      input: query
+      input: query,
     });
     const queryEmbedding = emb.data[0].embedding;
     const vecLiteral = `[${queryEmbedding.join(',')}]`;
@@ -79,13 +62,15 @@ export async function POST(req: Request) {
     const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
 
+    // fetch a few more so we can re-rank (faqs > products > policy)
     const sql = `
       select
         dc.document_id,
         d.url,
+        d.meta,
         dc.chunk_index,
         dc.content,
-        dc."sourceBucket",
+        d.meta->>'sourceBucket' as sourceBucket,
         1 - (dc.embedding <=> $1::vector) as similarity
       from document_chunks dc
       join documents d on d.id = dc.document_id
@@ -93,29 +78,51 @@ export async function POST(req: Request) {
       limit $2;
     `;
 
-    const { rows } = await client.query(sql, [vecLiteral, topK]);
+    const baseLimit = Math.max(topK, 10); // grab at least 10 to re-rank
+    const { rows } = await client.query(sql, [vecLiteral, baseLimit]);
     await client.end();
 
-    const res = NextResponse.json({
+    // re-rank: faq highest
+    const boosted = rows
+      .map((r: any) => {
+        let bucket = (r.sourcebucket || r.sourceBucket || '').toLowerCase();
+        let boost = 0;
+        if (bucket === 'faq') boost = 0.35;
+        else if (bucket === 'product') boost = 0.15;
+        // else policy 0
+        return {
+          ...r,
+          boostedScore: Number(r.similarity) + boost,
+        };
+      })
+      .sort((a: any, b: any) => b.boostedScore - a.boostedScore)
+      .slice(0, topK);
+
+    const resp = {
       ok: true,
       query,
-      results: rows.map((r: any) => ({
-        document_id: r.document_id,
-        url: r.url,
-        chunk_index: r.chunk_index,
-        content: r.content,
-        sourceBucket: r.sourceBucket,
-        similarity: Number(r.similarity)
-      }))
-    });
+      results: boosted.map((r: any) => {
+        // strip leading Q:/A:
+        let clean = (r.content || '').replace(/^Q:\s*/i, '').replace(/^A:\s*/i, '');
+        return {
+          document_id: r.document_id,
+          url: r.url,
+          sourceBucket: r.sourcebucket || r.sourceBucket || null,
+          content: clean,
+          similarity: Number(r.similarity),
+          boostedScore: Number(r.boostedScore),
+        };
+      }),
+    };
 
-    return cors(res, origin);
+    return cors(NextResponse.json(resp));
   } catch (err: any) {
     console.error('Search error:', err);
-    const res = NextResponse.json(
-      { ok: false, error: String(err?.message || err) },
-      { status: 500 }
+    return cors(
+      NextResponse.json(
+        { ok: false, error: err?.message || String(err) },
+        { status: 500 }
+      )
     );
-    return cors(res, origin);
   }
 }

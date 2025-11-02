@@ -4,14 +4,12 @@ import pkg from "pg";
 
 const { Client } = pkg;
 
-// --- Constants ---
-const FAQ_MIN_SIM = 0.78;
-const REVIEW_MIN_SIM = 0.70;
+// ↓↓↓ made it looser
+const FAQ_MIN_SIM = 0.63;   // was 0.78
 const MAX_RETURN = 3;
 const REVIEW_GOOGLE_URL =
   "https://www.google.com/search?q=wimo+ready+to+wear+saree+reviews";
 
-// --- Helpers ---
 function normalize(str: string) {
   return str
     .toLowerCase()
@@ -30,7 +28,7 @@ function scoreReview(reviewText: string, query: string): number {
   return hits;
 }
 
-// --- Local reviews placeholder ---
+// placeholder; you can remove once reviews table is used
 const REVIEWS = [
   { text: "Loved the ready to wear saree! The fit and finishing were amazing.", date: "2025-10-21" },
   { text: "Excellent service, they even customized the saree to my measurements.", date: "2025-09-29" },
@@ -38,7 +36,7 @@ const REVIEWS = [
   { text: "Very comfortable fabric. I’ll definitely buy again!", date: "2025-09-10" },
 ];
 
-// --- CORS handler ---
+// CORS preflight
 export async function OPTIONS() {
   return new Response(null, {
     status: 204,
@@ -50,7 +48,6 @@ export async function OPTIONS() {
   });
 }
 
-// --- GET route for sanity check ---
 export async function GET() {
   return new Response(JSON.stringify({ ok: true, msg: "search route is alive" }), {
     status: 200,
@@ -61,33 +58,27 @@ export async function GET() {
   });
 }
 
-// --- POST route ---
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
     const query = (body?.query ?? "").toString().trim();
     const wantReviewsOnly = !!body?.showReviews;
-    const topK = Math.min(Math.max(Number(body?.topK ?? 10), 1), 20);
+    const askDebug = !!body?.debug;             // 👈 to see what PG returned
+    const topK = Math.min(Math.max(Number(body?.topK ?? 12), 1), 30);
 
     if (!query) {
-      return new Response(JSON.stringify({ ok: false, error: "Missing 'query'" }), {
-        status: 400,
-        headers: { "Access-Control-Allow-Origin": "*" },
-      });
+      return json({ ok: false, error: "Missing 'query'" }, 400);
     }
 
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const SUPABASE_CONN = process.env.SUPABASE_CONN;
     if (!OPENAI_API_KEY || !SUPABASE_CONN) {
-      return new Response(JSON.stringify({ ok: false, error: "Missing keys" }), {
-        status: 500,
-        headers: { "Access-Control-Allow-Origin": "*" },
-      });
+      return json({ ok: false, error: "Missing OPENAI_API_KEY or SUPABASE_CONN" }, 500);
     }
 
     const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-    // Create embedding for query
+    // 1) embed query
     const emb = await openai.embeddings.create({
       model: "text-embedding-3-small",
       input: query,
@@ -95,7 +86,7 @@ export async function POST(req: Request) {
     const queryEmbedding = emb.data[0].embedding;
     const vecLiteral = `[${queryEmbedding.join(",")}]`;
 
-    // Connect to Supabase (Postgres)
+    // 2) fetch chunks from Postgres
     const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
 
@@ -117,7 +108,10 @@ export async function POST(req: Request) {
     const { rows } = await client.query(sql, [vecLiteral, topK]);
     await client.end();
 
+    // 3) normalize source
     const enriched = rows.map((r: any) => {
+      // documents.meta is set, but document_chunks.meta was null for FAQ
+      // so we fallback to: if url contains google → google-review, else faq
       const source =
         (r.meta && typeof r.meta === "object" && (r.meta.source || r.meta.type)) ||
         (r.url?.includes("google") ? "google-review" : "faq");
@@ -131,7 +125,7 @@ export async function POST(req: Request) {
       };
     });
 
-    // --- CASE 1: User explicitly asked for reviews ---
+    // 4) user clicked "yes, check reviews" -> you already added this in Wix
     if (wantReviewsOnly) {
       const scored = REVIEWS.map((r) => ({
         ...r,
@@ -143,30 +137,27 @@ export async function POST(req: Request) {
           b.__score !== a.__score ? b.__score - a.__score : b.__date - a.__date
         );
 
-      const topReviews = scored.slice(0, MAX_RETURN);
-      return new Response(
-        JSON.stringify({
+      const topReviews = scored.slice(0, 3);
+      return json(
+        {
           ok: true,
           query,
           source: "google-review",
           results: topReviews.map((r) => ({ content: r.text, date: r.date })),
           reviewLink: REVIEW_GOOGLE_URL,
-        }),
-        {
-          status: 200,
-          headers: { "Access-Control-Allow-Origin": "*" },
-        }
+        },
+        200
       );
     }
 
-    // --- CASE 2: FAQ-FIRST ---
+    // 5) FAQ-FIRST branch (this is the one that didn’t trigger for you)
     const faqHits = enriched
       .filter((r: any) => r.source === "faq" && r.similarity >= FAQ_MIN_SIM)
-      .slice(0, MAX_RETURN);
+      .slice(0, 3);
 
     if (faqHits.length > 0) {
-      return new Response(
-        JSON.stringify({
+      return json(
+        {
           ok: true,
           query,
           source: "faq",
@@ -175,15 +166,14 @@ export async function POST(req: Request) {
             similarity: r.similarity,
           })),
           canShowReviews: true,
-        }),
-        {
-          status: 200,
-          headers: { "Access-Control-Allow-Origin": "*" },
-        }
+          // 👇 for debugging in Wix: see what else matched
+          ...(askDebug ? { debug: { top: enriched.slice(0, 8) } } : {}),
+        },
+        200
       );
     }
 
-    // --- CASE 3: fallback to reviews if no FAQ found ---
+    // 6) fallback to reviews
     const scored = REVIEWS.map((r) => ({
       ...r,
       __score: scoreReview(r.text, query),
@@ -194,42 +184,46 @@ export async function POST(req: Request) {
         b.__score !== a.__score ? b.__score - a.__score : b.__date - a.__date
       );
 
-    const topReviews = scored.slice(0, MAX_RETURN);
+    const topReviews = scored.slice(0, 3);
     if (topReviews.length > 0) {
-      return new Response(
-        JSON.stringify({
+      return json(
+        {
           ok: true,
           query,
           source: "google-review",
           results: topReviews.map((r) => ({ content: r.text, date: r.date })),
           reviewLink: REVIEW_GOOGLE_URL,
-        }),
-        {
-          status: 200,
-          headers: { "Access-Control-Allow-Origin": "*" },
-        }
+          ...(askDebug ? { debug: { top: enriched.slice(0, 8) } } : {}),
+        },
+        200
       );
     }
 
-    // --- CASE 4: none found ---
-    return new Response(
-      JSON.stringify({
+    // 7) truly nothing
+    return json(
+      {
         ok: true,
         query,
         source: "none",
         results: [],
         message: "I couldn’t find this in FAQs or reviews.",
-      }),
-      {
-        status: 200,
-        headers: { "Access-Control-Allow-Origin": "*" },
-      }
+        ...(askDebug ? { debug: { top: enriched.slice(0, 8) } } : {}),
+      },
+      200
     );
   } catch (err: any) {
     console.error("Search error:", err);
-    return new Response(JSON.stringify({ ok: false, error: String(err?.message || err) }), {
-      status: 500,
-      headers: { "Access-Control-Allow-Origin": "*" },
-    });
+    return json({ ok: false, error: String(err?.message || err) }, 500);
   }
+}
+
+// helper to always send CORS
+function json(obj: any, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Content-Type": "application/json",
+    },
+  });
 }

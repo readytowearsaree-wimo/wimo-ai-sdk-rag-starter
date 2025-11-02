@@ -1,17 +1,17 @@
-// app/api/search/route.ts
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import pkg from "pg";
 
 const { Client } = pkg;
 
-// thresholds
+// --- Constants ---
 const FAQ_MIN_SIM = 0.78;
+const REVIEW_MIN_SIM = 0.70;
 const MAX_RETURN = 3;
 const REVIEW_GOOGLE_URL =
   "https://www.google.com/search?q=wimo+ready+to+wear+saree+reviews";
 
-// helpers
+// --- Helpers ---
 function normalize(str: string) {
   return str
     .toLowerCase()
@@ -21,19 +21,47 @@ function normalize(str: string) {
 }
 
 function scoreReview(reviewText: string, query: string): number {
-  const qWords = normalize(query).split(" ").filter(Boolean);
+  const q = normalize(query).split(" ").filter(Boolean);
   const r = normalize(reviewText);
   let hits = 0;
-  for (const w of qWords) {
-    if (r.includes(w)) hits += 1;
+  for (const word of q) {
+    if (r.includes(word)) hits += 1;
   }
   return hits;
 }
 
-export async function GET() {
-  return NextResponse.json({ ok: true, msg: "search route is alive" });
+// --- Local reviews placeholder ---
+const REVIEWS = [
+  { text: "Loved the ready to wear saree! The fit and finishing were amazing.", date: "2025-10-21" },
+  { text: "Excellent service, they even customized the saree to my measurements.", date: "2025-09-29" },
+  { text: "Delivery was super quick and the saree draped beautifully!", date: "2025-09-15" },
+  { text: "Very comfortable fabric. I’ll definitely buy again!", date: "2025-09-10" },
+];
+
+// --- CORS handler ---
+export async function OPTIONS() {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    },
+  });
 }
 
+// --- GET route for sanity check ---
+export async function GET() {
+  return new Response(JSON.stringify({ ok: true, msg: "search route is alive" }), {
+    status: 200,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Content-Type": "application/json",
+    },
+  });
+}
+
+// --- POST route ---
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
@@ -42,28 +70,24 @@ export async function POST(req: Request) {
     const topK = Math.min(Math.max(Number(body?.topK ?? 10), 1), 20);
 
     if (!query) {
-      return NextResponse.json(
-        { ok: false, error: 'Missing "query"' },
-        { status: 400 }
-      );
+      return new Response(JSON.stringify({ ok: false, error: "Missing 'query'" }), {
+        status: 400,
+        headers: { "Access-Control-Allow-Origin": "*" },
+      });
     }
 
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const SUPABASE_CONN = process.env.SUPABASE_CONN;
     if (!OPENAI_API_KEY || !SUPABASE_CONN) {
-      return NextResponse.json(
-        { ok: false, error: "Missing OPENAI_API_KEY or SUPABASE_CONN" },
-        { status: 500 }
-      );
+      return new Response(JSON.stringify({ ok: false, error: "Missing keys" }), {
+        status: 500,
+        headers: { "Access-Control-Allow-Origin": "*" },
+      });
     }
 
     const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-    const client = new Client({ connectionString: SUPABASE_CONN });
-    await client.connect();
 
-    // ─────────────────────────────────────────
-    // 1) embed user query (for FAQ vector search only)
-    // ─────────────────────────────────────────
+    // Create embedding for query
     const emb = await openai.embeddings.create({
       model: "text-embedding-3-small",
       input: query,
@@ -71,98 +95,32 @@ export async function POST(req: Request) {
     const queryEmbedding = emb.data[0].embedding;
     const vecLiteral = `[${queryEmbedding.join(",")}]`;
 
-    // helper: fetch reviews (NO vector, just by source)
-    async function fetchReviewsFromDB(limit = 300) {
-      const reviewsSql = `
-        select
-          dc.document_id,
-          d.url,
-          d.meta as doc_meta,
-          dc.content,
-          dc.created_at
-        from document_chunks dc
-        join documents d on d.id = dc.document_id
-        where (d.meta->>'source') = 'google-review'
-        order by dc.created_at desc
-        limit $1;
-      `;
-      const { rows } = await client.query(reviewsSql, [limit]);
-      return rows;
-    }
+    // Connect to Supabase (Postgres)
+    const client = new Client({ connectionString: SUPABASE_CONN });
+    await client.connect();
 
-    // ─────────────────────────────────────────
-    // BRANCH A: user clicked "see related reviews"
-    // ─────────────────────────────────────────
-    if (wantReviewsOnly) {
-      const reviewRows = await fetchReviewsFromDB();
-
-      const ranked = reviewRows
-        .map((r: any) => {
-          const score = scoreReview(r.content || "", query);
-          const ts = r.created_at ? new Date(r.created_at).getTime() : 0;
-          return {
-            content: r.content,
-            date: r.created_at,
-            score,
-            ts,
-          };
-        })
-        .filter((r) => r.score > 0)
-        .sort((a, b) => {
-          if (b.score !== a.score) return b.score - a.score;
-          return b.ts - a.ts;
-        })
-        .slice(0, MAX_RETURN);
-
-      await client.end();
-
-      if (ranked.length > 0) {
-        return NextResponse.json({
-          ok: true,
-          query,
-          source: "review",
-          results: ranked,
-          reviewLink: REVIEW_GOOGLE_URL,
-        });
-      } else {
-        return NextResponse.json({
-          ok: true,
-          query,
-          source: "review",
-          results: [],
-          message:
-            "I didn’t find a very close review for this, but you can see all our 4.8★ Google reviews here.",
-          reviewLink: REVIEW_GOOGLE_URL,
-        });
-      }
-    }
-
-    // ─────────────────────────────────────────
-    // 2) normal flow → do FAQ vector search
-    // (remember: ONLY FAQ chunks have embeddings)
-    // ─────────────────────────────────────────
-    const faqSql = `
+    const sql = `
       select
         dc.document_id,
         d.url,
-        d.meta as doc_meta,
+        d.meta,
         dc.chunk_index,
         dc.content,
         1 - (dc.embedding <=> $1::vector) as similarity
       from document_chunks dc
       join documents d on d.id = dc.document_id
-      where dc.embedding is not null   -- ✅ ignore review chunks
+      where dc.embedding is not null
       order by dc.embedding <=> $1::vector
       limit $2;
     `;
 
-    const { rows } = await client.query(faqSql, [vecLiteral, topK]);
+    const { rows } = await client.query(sql, [vecLiteral, topK]);
+    await client.end();
 
-    // figure out source from documents.meta (because dc.meta is null)
     const enriched = rows.map((r: any) => {
       const source =
-    (r.meta && typeof r.meta === 'object' && (r.meta.source || r.meta.type)) ||
-    'faq';
+        (r.meta && typeof r.meta === "object" && (r.meta.source || r.meta.type)) ||
+        (r.url?.includes("google") ? "google-review" : "faq");
       return {
         document_id: r.document_id,
         url: r.url,
@@ -173,74 +131,105 @@ export async function POST(req: Request) {
       };
     });
 
+    // --- CASE 1: User explicitly asked for reviews ---
+    if (wantReviewsOnly) {
+      const scored = REVIEWS.map((r) => ({
+        ...r,
+        __score: scoreReview(r.text, query),
+        __date: r.date ? new Date(r.date).getTime() : 0,
+      }))
+        .filter((r) => r.__score > 0)
+        .sort((a, b) =>
+          b.__score !== a.__score ? b.__score - a.__score : b.__date - a.__date
+        );
+
+      const topReviews = scored.slice(0, MAX_RETURN);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          query,
+          source: "google-review",
+          results: topReviews.map((r) => ({ content: r.text, date: r.date })),
+          reviewLink: REVIEW_GOOGLE_URL,
+        }),
+        {
+          status: 200,
+          headers: { "Access-Control-Allow-Origin": "*" },
+        }
+      );
+    }
+
+    // --- CASE 2: FAQ-FIRST ---
     const faqHits = enriched
-      .filter((r) => r.source === "faq" && r.similarity >= FAQ_MIN_SIM)
+      .filter((r: any) => r.source === "faq" && r.similarity >= FAQ_MIN_SIM)
       .slice(0, MAX_RETURN);
 
     if (faqHits.length > 0) {
-      await client.end();
-      return NextResponse.json({
-        ok: true,
-        query,
-        source: "faq",
-        results: faqHits.map((r) => ({
-          content: r.content,
-          similarity: r.similarity,
-        })),
-        canShowReviews: true, // 👈 frontend can now call again with showReviews:true
-      });
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          query,
+          source: "faq",
+          results: faqHits.map((r) => ({
+            content: r.content,
+            similarity: r.similarity,
+          })),
+          canShowReviews: true,
+        }),
+        {
+          status: 200,
+          headers: { "Access-Control-Allow-Origin": "*" },
+        }
+      );
     }
 
-    // ─────────────────────────────────────────
-    // 3) no FAQ match → try reviews now (NO vector)
-    // ─────────────────────────────────────────
-    const reviewRows = await fetchReviewsFromDB();
-    const ranked = reviewRows
-      .map((r: any) => {
-        const score = scoreReview(r.content || "", query);
-        const ts = r.created_at ? new Date(r.created_at).getTime() : 0;
-        return {
-          content: r.content,
-          date: r.created_at,
-          score,
-          ts,
-        };
-      })
-      .filter((r) => r.score > 0)
-      .sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
-        return b.ts - a.ts;
-      })
-      .slice(0, MAX_RETURN);
+    // --- CASE 3: fallback to reviews if no FAQ found ---
+    const scored = REVIEWS.map((r) => ({
+      ...r,
+      __score: scoreReview(r.text, query),
+      __date: r.date ? new Date(r.date).getTime() : 0,
+    }))
+      .filter((r) => r.__score > 0)
+      .sort((a, b) =>
+        b.__score !== a.__score ? b.__score - a.__score : b.__date - a.__date
+      );
 
-    await client.end();
-
-    if (ranked.length > 0) {
-      return NextResponse.json({
-        ok: true,
-        query,
-        source: "review",
-        results: ranked,
-        reviewLink: REVIEW_GOOGLE_URL,
-      });
+    const topReviews = scored.slice(0, MAX_RETURN);
+    if (topReviews.length > 0) {
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          query,
+          source: "google-review",
+          results: topReviews.map((r) => ({ content: r.text, date: r.date })),
+          reviewLink: REVIEW_GOOGLE_URL,
+        }),
+        {
+          status: 200,
+          headers: { "Access-Control-Allow-Origin": "*" },
+        }
+      );
     }
 
-    // ─────────────────────────────────────────
-    // 4) absolutely nothing
-    // ─────────────────────────────────────────
-    return NextResponse.json({
-      ok: true,
-      query,
-      source: "none",
-      results: [],
-      message:
-        "I couldn’t find this in FAQs or reviews. Please chat with us on WhatsApp 👇",
-    });
+    // --- CASE 4: none found ---
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        query,
+        source: "none",
+        results: [],
+        message: "I couldn’t find this in FAQs or reviews.",
+      }),
+      {
+        status: 200,
+        headers: { "Access-Control-Allow-Origin": "*" },
+      }
+    );
   } catch (err: any) {
     console.error("Search error:", err);
-    return NextResponse.json(
-      { ok: false, error: String(err?.message || err) },
-      { status: 500 }
-    );
+    return new Response(JSON.stringify({ ok: false, error: String(err?.message || err) }), {
+      status: 500,
+      headers: { "Access-Control-Allow-Origin": "*" },
+    });
   }
 }

@@ -1,4 +1,3 @@
-// app/api/ingest/route.ts
 import { NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
 import * as cheerio from "cheerio";
@@ -7,107 +6,123 @@ import pkg from "pg";
 
 const { Client } = pkg;
 
+// simple helper to split long text into chunks
+function chunkText(text: string, max = 1200): string[] {
+  const parts: string[] = [];
+  let current = text.trim();
+
+  while (current.length > max) {
+    // try to break on a sentence
+    let idx =
+      current.lastIndexOf(".", max) > 0
+        ? current.lastIndexOf(".", max) + 1
+        : max;
+    parts.push(current.slice(0, idx).trim());
+    current = current.slice(idx).trim();
+  }
+
+  if (current.length) parts.push(current);
+  return parts;
+}
+
+// fetch HTML and turn into plain text (your earlier flow)
+async function fetchHtmlAsText(url: string): Promise<string | null> {
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const html = await res.text();
+  const $ = cheerio.load(html);
+  return $("body").text().replace(/\s+/g, " ").trim();
+}
+
 export async function POST(req: Request) {
-  // we will fill this and return once at the end
-  let finalResponse: any = null;
+  const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+  const SUPABASE_CONN = process.env.SUPABASE_CONN;
+
+  if (!OPENAI_API_KEY || !SUPABASE_CONN) {
+    return NextResponse.json(
+      { ok: false, error: "Missing OPENAI_API_KEY or SUPABASE_CONN" },
+      { status: 400 }
+    );
+  }
+
+  const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+  const client = new Client({ connectionString: SUPABASE_CONN });
 
   try {
-    console.log("Incoming ingestion request");
+    await client.connect();
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    const SUPABASE_CONN = process.env.SUPABASE_CONN;
+    // 1) read body
+    const body = await req.json().catch(() => ({}));
+    const url: string | undefined = body.url;
+    const text: string | undefined = body.text;
+    const sourceBucket: string = body.sourceBucket || "faq";
 
-    if (!OPENAI_API_KEY || !SUPABASE_CONN) {
+    // we need at least one of them
+    if (!url && !text) {
+      await client.end();
       return NextResponse.json(
-        { ok: false, error: "Missing OPENAI_API_KEY or SUPABASE_CONN" },
+        { ok: false, error: "No url or text provided" },
         { status: 400 }
       );
     }
 
-    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-    const client = new Client({ connectionString: SUPABASE_CONN });
-    await client.connect();
-
-    // read body
-    const body = await req.json();
-console.log("Body received:", body);
-    const text = body.text as string | undefined;
-    const url = body.url as string | undefined;
-    const sourceBucket =
-      (body.sourceBucket as string | undefined) || "faq"; // default like before
-
-    // ─────────────────────────────────────────────
-    // CASE 1: TEXT INGEST (your google reviews)
-    // ─────────────────────────────────────────────
-    if (text && !url) {
-      // create a fake, non-null url so postgres doesn't complain
+    // =====================================================================
+    // CASE 1: RAW TEXT INGEST (this is what we use for Google reviews)
+    // =====================================================================
+    if (text) {
       const docId = uuidv4();
-      const fakeUrl = `text://${sourceBucket}/${docId}`;
+
+      // you don’t have a real url for reviews, so we store a fake/marker url
+      const fakeUrl = `text://google-reviews/${docId}`;
 
       // insert into documents
-console.log("Inserting document to Supabase");
-
       await client.query(
         `INSERT INTO documents (id, url, content, meta)
          VALUES ($1, $2, $3, $4)`,
         [docId, fakeUrl, text, JSON.stringify({ source: sourceBucket })]
       );
-console.log("Creating embeddings for chunk");
 
-      // now split text into chunks (very simple split; you can improve later)
-      const MAX_CHARS = 1800;
-      const chunks: string[] = [];
-      for (let i = 0; i < text.length; i += MAX_CHARS) {
-        chunks.push(text.slice(i, i + MAX_CHARS));
-      }
+      // chunk and embed
+      const chunks = chunkText(text);
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
 
-      for (const chunk of chunks) {
-        // create embedding
-        const embeddingRes = await openai.embeddings.create({
-          model: "text-embedding-3-small",
+        const embedding = await openai.embeddings.create({
+          model: "text-embedding-3-large",
           input: chunk,
         });
 
-        const embedding = embeddingRes.data[0].embedding;
-console.log("Inserting document to Supabase");
-
         await client.query(
           `INSERT INTO document_chunks
-            (id, document_id, content, embedding, meta)
-            VALUES ($1, $2, $3, $4, $5)`,
+             (id, document_id, content, embedding, meta)
+           VALUES ($1, $2, $3, $4, $5)`,
           [
             uuidv4(),
             docId,
             chunk,
-            JSON.stringify(embedding),
-            JSON.stringify({ source: sourceBucket }),
+            embedding.data[0].embedding,
+            JSON.stringify({
+              source: sourceBucket,
+              chunk_index: i,
+            }),
           ]
         );
-
-console.log("Creating embeddings for chunk");
-
       }
 
       await client.end();
-
-      finalResponse = {
+      return NextResponse.json({
         ok: true,
-        message: "Reviews/text ingestion complete",
-        source: sourceBucket,
+        message: "Text / reviews ingestion complete",
         chunks: chunks.length,
-      };
+        document_id: docId,
+      });
     }
 
-    // ─────────────────────────────────────────────
+    // =====================================================================
     // CASE 2: URL INGEST (your original flow)
-    // ─────────────────────────────────────────────
-    else if (url) {
-      // fetch & extract text from URL
-      const res = await fetch(url);
-      const html = await res.text();
-      const $ = cheerio.load(html);
-      const pageText = $("body").text().replace(/\s+/g, " ").trim();
-
+    // =====================================================================
+    if (url) {
+      const pageText = await fetchHtmlAsText(url);
       if (!pageText) {
         await client.end();
         return NextResponse.json(
@@ -117,70 +132,66 @@ console.log("Creating embeddings for chunk");
       }
 
       const docId = uuidv4();
-console.log("Inserting document to Supabase");
 
       await client.query(
         `INSERT INTO documents (id, url, content, meta)
          VALUES ($1, $2, $3, $4)`,
         [docId, url, pageText, JSON.stringify({ source: sourceBucket })]
       );
-console.log("Creating embeddings for chunk");
 
-      // simple chunking
-      const MAX_CHARS = 1800;
-      const chunks: string[] = [];
-      for (let i = 0; i < pageText.length; i += MAX_CHARS) {
-        chunks.push(pageText.slice(i, i + MAX_CHARS));
-      }
+      const chunks = chunkText(pageText);
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
 
-      for (const chunk of chunks) {
-        const embeddingRes = await openai.embeddings.create({
-          model: "text-embedding-3-small",
+        const embedding = await openai.embeddings.create({
+          model: "text-embedding-3-large",
           input: chunk,
         });
-        const embedding = embeddingRes.data[0].embedding;
-console.log("Inserting document to Supabase");
 
         await client.query(
           `INSERT INTO document_chunks
-            (id, document_id, content, embedding, meta)
-            VALUES ($1, $2, $3, $4, $5)`,
+             (id, document_id, content, embedding, meta)
+           VALUES ($1, $2, $3, $4, $5)`,
           [
             uuidv4(),
             docId,
             chunk,
-            JSON.stringify(embedding),
-            JSON.stringify({ source: sourceBucket }),
+            embedding.data[0].embedding,
+            JSON.stringify({
+              source: sourceBucket,
+              chunk_index: i,
+              from_url: url,
+            }),
           ]
         );
-console.log("Creating embeddings for chunk");
-
       }
 
       await client.end();
-
-      finalResponse = {
+      return NextResponse.json({
         ok: true,
         message: "URL ingestion complete",
         url,
         chunks: chunks.length,
-      };
+        document_id: docId,
+      });
     }
 
-    // ─────────────────────────────────────────────
-    // CASE 3: nothing given
-    // ─────────────────────────────────────────────
-    else {
-      finalResponse = { ok: false, error: "No url or text provided" };
-    }
+    // fallback — we should never reach here
+    await client.end();
+    return NextResponse.json(
+      { ok: false, error: "Nothing ingested" },
+      { status: 400 }
+    );
   } catch (err: any) {
     console.error("Ingest error:", err);
+    try {
+      await new Client({ connectionString: process.env.SUPABASE_CONN! }).end();
+    } catch (e) {
+      // ignore
+    }
     return NextResponse.json(
       { ok: false, error: String(err?.message || err) },
       { status: 500 }
     );
   }
-
-  // single exit
-  return NextResponse.json(finalResponse);
 }

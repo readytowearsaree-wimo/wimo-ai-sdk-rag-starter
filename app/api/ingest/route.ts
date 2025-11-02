@@ -1,3 +1,4 @@
+// app/api/ingest/route.ts
 import { NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
 import * as cheerio from "cheerio";
@@ -7,6 +8,9 @@ import pkg from "pg";
 const { Client } = pkg;
 
 export async function POST(req: Request) {
+  // we will fill this and return once at the end
+  let finalResponse: any = null;
+
   try {
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const SUPABASE_CONN = process.env.SUPABASE_CONN;
@@ -22,64 +26,146 @@ export async function POST(req: Request) {
     const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
 
+    // read body
     const body = await req.json();
-    const { url, text } = body;
+    const text = body.text as string | undefined;
+    const url = body.url as string | undefined;
+    const sourceBucket =
+      (body.sourceBucket as string | undefined) || "faq"; // default like before
 
-    // ✅ Must have either URL or text
-    if (!url && !text) {
-      await client.end();
-      return NextResponse.json(
-        { ok: false, error: "No url or text provided" },
-        { status: 400 }
+    // ─────────────────────────────────────────────
+    // CASE 1: TEXT INGEST (your google reviews)
+    // ─────────────────────────────────────────────
+    if (text && !url) {
+      // create a fake, non-null url so postgres doesn't complain
+      const docId = uuidv4();
+      const fakeUrl = `text://${sourceBucket}/${docId}`;
+
+      // insert into documents
+      await client.query(
+        `INSERT INTO documents (id, url, content, meta)
+         VALUES ($1, $2, $3, $4)`,
+        [docId, fakeUrl, text, JSON.stringify({ source: sourceBucket })]
       );
+
+      // now split text into chunks (very simple split; you can improve later)
+      const MAX_CHARS = 1800;
+      const chunks: string[] = [];
+      for (let i = 0; i < text.length; i += MAX_CHARS) {
+        chunks.push(text.slice(i, i + MAX_CHARS));
+      }
+
+      for (const chunk of chunks) {
+        // create embedding
+        const embeddingRes = await openai.embeddings.create({
+          model: "text-embedding-3-small",
+          input: chunk,
+        });
+
+        const embedding = embeddingRes.data[0].embedding;
+
+        await client.query(
+          `INSERT INTO document_chunks
+            (id, document_id, content, embedding, meta)
+            VALUES ($1, $2, $3, $4, $5)`,
+          [
+            uuidv4(),
+            docId,
+            chunk,
+            JSON.stringify(embedding),
+            JSON.stringify({ source: sourceBucket }),
+          ]
+        );
+      }
+
+      await client.end();
+
+      finalResponse = {
+        ok: true,
+        message: "Reviews/text ingestion complete",
+        source: sourceBucket,
+        chunks: chunks.length,
+      };
     }
 
-    let content = "";
-
-    // ✅ If text provided, use directly
-    if (text) {
-      content = text;
-    } else if (url) {
-      // ✅ Fetch & extract HTML text
+    // ─────────────────────────────────────────────
+    // CASE 2: URL INGEST (your original flow)
+    // ─────────────────────────────────────────────
+    else if (url) {
+      // fetch & extract text from URL
       const res = await fetch(url);
       const html = await res.text();
       const $ = cheerio.load(html);
-      $("script,style,noscript,nav,footer").remove();
-      content = $("body").text().replace(/\s+/g, " ").trim();
-    }
+      const pageText = $("body").text().replace(/\s+/g, " ").trim();
 
-    if (!content) {
-      await client.end();
-      return NextResponse.json(
-        { ok: false, error: "Empty content after processing" },
-        { status: 400 }
+      if (!pageText) {
+        await client.end();
+        return NextResponse.json(
+          { ok: false, error: "Could not extract text from URL" },
+          { status: 400 }
+        );
+      }
+
+      const docId = uuidv4();
+
+      await client.query(
+        `INSERT INTO documents (id, url, content, meta)
+         VALUES ($1, $2, $3, $4)`,
+        [docId, url, pageText, JSON.stringify({ source: sourceBucket })]
       );
+
+      // simple chunking
+      const MAX_CHARS = 1800;
+      const chunks: string[] = [];
+      for (let i = 0; i < pageText.length; i += MAX_CHARS) {
+        chunks.push(pageText.slice(i, i + MAX_CHARS));
+      }
+
+      for (const chunk of chunks) {
+        const embeddingRes = await openai.embeddings.create({
+          model: "text-embedding-3-small",
+          input: chunk,
+        });
+        const embedding = embeddingRes.data[0].embedding;
+
+        await client.query(
+          `INSERT INTO document_chunks
+            (id, document_id, content, embedding, meta)
+            VALUES ($1, $2, $3, $4, $5)`,
+          [
+            uuidv4(),
+            docId,
+            chunk,
+            JSON.stringify(embedding),
+            JSON.stringify({ source: sourceBucket }),
+          ]
+        );
+      }
+
+      await client.end();
+
+      finalResponse = {
+        ok: true,
+        message: "URL ingestion complete",
+        url,
+        chunks: chunks.length,
+      };
     }
 
-    const docId = uuidv4();
-
-    // ✅ Insert document into Supabase
-    const insertQuery = `
-      INSERT INTO documents (id, content, meta, created_at)
-      VALUES ($1, $2, $3, NOW())
-      RETURNING id;
-    `;
-    const meta = { source: url ? "faq" : "google-review" };
-    await client.query(insertQuery, [docId, content, meta]);
-
-    await client.end();
-
-    return NextResponse.json({
-      ok: true,
-      message: url ? "FAQ ingestion complete" : "Reviews/text ingestion complete",
-      source: meta.source,
-      characters: content.length,
-    });
+    // ─────────────────────────────────────────────
+    // CASE 3: nothing given
+    // ─────────────────────────────────────────────
+    else {
+      finalResponse = { ok: false, error: "No url or text provided" };
+    }
   } catch (err: any) {
     console.error("Ingest error:", err);
     return NextResponse.json(
-      { ok: false, error: err.message || String(err) },
+      { ok: false, error: String(err?.message || err) },
       { status: 500 }
     );
   }
+
+  // single exit
+  return NextResponse.json(finalResponse);
 }

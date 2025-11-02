@@ -45,12 +45,13 @@ console.log("Body received:", body);
       const fakeUrl = `text://${sourceBucket}/${docId}`;
 
       // insert into documents
+console.log("Inserting document to Supabase");
+
       await client.query(
         `INSERT INTO documents (id, url, content, meta)
          VALUES ($1, $2, $3, $4)`,
         [docId, fakeUrl, text, JSON.stringify({ source: sourceBucket })]
       );
-console.log("Inserting document to Supabase");
 console.log("Creating embeddings for chunk");
 
       // now split text into chunks (very simple split; you can improve later)
@@ -68,6 +69,7 @@ console.log("Creating embeddings for chunk");
         });
 
         const embedding = embeddingRes.data[0].embedding;
+console.log("Inserting document to Supabase");
 
         await client.query(
           `INSERT INTO document_chunks
@@ -81,7 +83,7 @@ console.log("Creating embeddings for chunk");
             JSON.stringify({ source: sourceBucket }),
           ]
         );
-console.log("Inserting document to Supabase");
+
 console.log("Creating embeddings for chunk");
 
       }
@@ -115,13 +117,13 @@ console.log("Creating embeddings for chunk");
       }
 
       const docId = uuidv4();
+console.log("Inserting document to Supabase");
 
       await client.query(
         `INSERT INTO documents (id, url, content, meta)
          VALUES ($1, $2, $3, $4)`,
         [docId, url, pageText, JSON.stringify({ source: sourceBucket })]
       );
-console.log("Inserting document to Supabase");
 console.log("Creating embeddings for chunk");
 
       // simple chunking
@@ -137,6 +139,7 @@ console.log("Creating embeddings for chunk");
           input: chunk,
         });
         const embedding = embeddingRes.data[0].embedding;
+console.log("Inserting document to Supabase");
 
         await client.query(
           `INSERT INTO document_chunks
@@ -150,7 +153,6 @@ console.log("Creating embeddings for chunk");
             JSON.stringify({ source: sourceBucket }),
           ]
         );
-console.log("Inserting document to Supabase");
 console.log("Creating embeddings for chunk");
 
       }

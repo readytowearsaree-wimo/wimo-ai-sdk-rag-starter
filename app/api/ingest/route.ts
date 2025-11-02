@@ -32,13 +32,48 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
-  try {
-    // 0) secret check (you already use this)
-    const ingestSecret = process.env.INGEST_SECRET || 'a2x9s8d2lkfj39fdks9021x';
-    const headerSecret = req.headers.get('x-ingest-secret') || '';
-    if (headerSecret !== ingestSecret) {
-      return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
-    }
+  const body = await req.json();
+  const { url, text } = body;
+
+  if (!url && !text) {
+    return NextResponse.json({ ok: false, error: "No url or text provided" }, { status: 400 });
+  }
+
+  let content = "";
+
+  if (url) {
+    // Fetch HTML and extract text content if URL provided
+    const res = await fetch(url);
+    const html = await res.text();
+    const $ = cheerio.load(html);
+    $("script, style, noscript, nav, footer").remove();
+    content = $("body").text().replace(/\s+/g, " ").trim();
+  } else if (text) {
+    // Directly use the provided text input
+    content = text;
+  }
+
+  if (!content) {
+    return NextResponse.json({ ok: false, error: "Empty content" }, { status: 400 });
+  }
+
+  // Create document
+  const { data, error } = await supabase
+    .from("documents")
+    .insert({
+      content,
+      meta: { source: url ? "url" : "google-review" }
+    })
+    .select("*");
+
+  if (error) {
+    console.error(error);
+    return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
+  }
+
+  return NextResponse.json({ ok: true, data });
+}
+
 
     const body = await req.json().catch(() => ({} as any));
     const { url, text } = body as { url?: string; text?: string };

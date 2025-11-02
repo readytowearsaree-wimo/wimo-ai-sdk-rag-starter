@@ -78,7 +78,7 @@ export async function POST(req: Request) {
       // insert into documents
       await client.query(
         `INSERT INTO documents (id, url, content, meta)
-         VALUES ($1, $2, $3, $4::vector)`,
+         VALUES ($1, $2, $3, $4)`,
         [docId, fakeUrl, text, JSON.stringify({ source: sourceBucket })]
       );
 
@@ -135,7 +135,7 @@ export async function POST(req: Request) {
 
       await client.query(
         `INSERT INTO documents (id, url, content, meta)
-         VALUES ($1, $2, $3, $4::vector)`,
+         VALUES ($1, $2, $3, $4)`,
         [docId, url, pageText, JSON.stringify({ source: sourceBucket })]
       );
 

@@ -1,6 +1,6 @@
 // app/api/ingest/route.ts
 import { NextResponse } from 'next/server';
-import cheerio from 'cheerio';
+import * as cheerio from 'cheerio';
 import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
 import pkg from 'pg';

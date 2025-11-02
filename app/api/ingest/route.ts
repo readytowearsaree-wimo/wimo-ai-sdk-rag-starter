@@ -95,7 +95,7 @@ export async function POST(req: Request) {
         await client.query(
           `INSERT INTO document_chunks
              (id, document_id, content, embedding, meta)
-           VALUES ($1, $2, $3, $4, $5)`,
+           VALUES ($1, $2, $3, $4::vector, $5)`,
           [
             uuidv4(),
             docId,
@@ -151,7 +151,7 @@ export async function POST(req: Request) {
         await client.query(
           `INSERT INTO document_chunks
              (id, document_id, content, embedding, meta)
-           VALUES ($1, $2, $3, $4, $5)`,
+           VALUES ($1, $2, $3, $4::vector, $5)`,
           [
             uuidv4(),
             docId,

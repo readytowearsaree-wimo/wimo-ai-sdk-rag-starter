@@ -1,3 +1,4 @@
+// app/api/ingest/route.ts
 import { NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
 import * as cheerio from "cheerio";
@@ -6,32 +7,30 @@ import pkg from "pg";
 
 const { Client } = pkg;
 
-// simple helper to split long text into chunks
-function chunkText(text: string, max = 1200): string[] {
-  const parts: string[] = [];
-  let current = text.trim();
-
-  while (current.length > max) {
-    // try to break on a sentence
-    let idx =
-      current.lastIndexOf(".", max) > 0
-        ? current.lastIndexOf(".", max) + 1
-        : max;
-    parts.push(current.slice(0, idx).trim());
-    current = current.slice(idx).trim();
+// tiny helper – fetch page and return plain text
+async function fetchHtmlAsText(url: string): Promise<string | null> {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const html = await res.text();
+    const $ = cheerio.load(html);
+    // very simple text extractor
+    return $("body").text().replace(/\s+/g, " ").trim();
+  } catch (err) {
+    console.error("fetchHtmlAsText error:", err);
+    return null;
   }
-
-  if (current.length) parts.push(current);
-  return parts;
 }
 
-// fetch HTML and turn into plain text (your earlier flow)
-async function fetchHtmlAsText(url: string): Promise<string | null> {
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const html = await res.text();
-  const $ = cheerio.load(html);
-  return $("body").text().replace(/\s+/g, " ").trim();
+// very simple chunker
+function chunkText(text: string, size = 1500): string[] {
+  const chunks: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    chunks.push(text.slice(i, i + size));
+    i += size;
+  }
+  return chunks;
 }
 
 export async function POST(req: Request) {
@@ -45,83 +44,32 @@ export async function POST(req: Request) {
     );
   }
 
-  const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+  // validate secret (like you were doing from curl / PowerShell)
+  const incomingSecret = req.headers.get("x-ingest-secret");
+  if (!incomingSecret || incomingSecret !== "a2x9s8d2lkfj39fdks9021x") {
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
+
+  const body = await req.json().catch(() => ({} as any));
+  const { url, text, sourceBucket } = body as {
+    url?: string;
+    text?: string;
+    sourceBucket?: string;
+  };
+
+  // you said: sometimes we send only text (reviews), sometimes only url (old flow)
+  if (!url && !text) {
+    return NextResponse.json({ ok: false, error: "No url or text provided" }, { status: 400 });
+  }
+
   const client = new Client({ connectionString: SUPABASE_CONN });
+  await client.connect();
 
   try {
-    await client.connect();
+    // 1) decide the content we will store
+    let fullText = text ?? "";
 
-    // 1) read body
-    const body = await req.json().catch(() => ({}));
-    const url: string | undefined = body.url;
-    const text: string | undefined = body.text;
-    const sourceBucket: string = body.sourceBucket || "faq";
-
-    // we need at least one of them
-    if (!url && !text) {
-      await client.end();
-      return NextResponse.json(
-        { ok: false, error: "No url or text provided" },
-        { status: 400 }
-      );
-    }
-
-    // =====================================================================
-    // CASE 1: RAW TEXT INGEST (this is what we use for Google reviews)
-    // =====================================================================
-    if (text) {
-      const docId = uuidv4();
-
-      // you don’t have a real url for reviews, so we store a fake/marker url
-      const fakeUrl = `text://google-reviews/${docId}`;
-
-      // insert into documents
-      await client.query(
-        `INSERT INTO documents (id, url, content, meta)
-         VALUES ($1, $2, $3, $4)`,
-        [docId, fakeUrl, text, JSON.stringify({ source: sourceBucket })]
-      );
-
-      // chunk and embed
-      const chunks = chunkText(text);
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-
-        const embedding = await openai.embeddings.create({
-          model: "text-embedding-3-large",
-          input: chunk,
-        });
-
-        await client.query(
-          `INSERT INTO document_chunks
-             (id, document_id, content, embedding, meta)
-           VALUES ($1, $2, $3, $4::vector, $5)`,
-          [
-            uuidv4(),
-            docId,
-            chunk,
-            embedding.data[0].embedding,
-            JSON.stringify({
-              source: sourceBucket,
-              chunk_index: i,
-            }),
-          ]
-        );
-      }
-
-      await client.end();
-      return NextResponse.json({
-        ok: true,
-        message: "Text / reviews ingestion complete",
-        chunks: chunks.length,
-        document_id: docId,
-      });
-    }
-
-    // =====================================================================
-    // CASE 2: URL INGEST (your original flow)
-    // =====================================================================
-    if (url) {
+    if (url && !text) {
       const pageText = await fetchHtmlAsText(url);
       if (!pageText) {
         await client.end();
@@ -130,71 +78,58 @@ export async function POST(req: Request) {
           { status: 400 }
         );
       }
-
-      const docId = uuidv4();
-
-      await client.query(
-        `INSERT INTO documents (id, url, content, meta)
-         VALUES ($1, $2, $3, $4)`,
-        [docId, url, pageText, JSON.stringify({ source: sourceBucket })]
-      );
-
-      const chunks = chunkText(pageText);
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-
-        const embedding = await openai.embeddings.create({
-          model: "text-embedding-3-large",
-          input: chunk,
-        });
-
-        await client.query(
-          `INSERT INTO document_chunks
-             (id, document_id, content, embedding, meta)
-           VALUES ($1, $2, $3, $4::vector, $5)`,
-          [
-            uuidv4(),
-            docId,
-            chunk,
-            embedding.data[0].embedding,
-            JSON.stringify({
-              source: sourceBucket,
-              chunk_index: i,
-              from_url: url,
-            }),
-          ]
-        );
-      }
-
-      await client.end();
-      return NextResponse.json({
-        ok: true,
-        message: "URL ingestion complete",
-        url,
-        chunks: chunks.length,
-        document_id: docId,
-      });
+      fullText = pageText;
     }
 
-    // fallback — we should never reach here
+    // 2) make a document id
+    const docId = uuidv4();
+
+    // 3) insert into documents – HERE we can store meta with source
+    const meta = {
+      source: sourceBucket ? sourceBucket : url ? "url" : "faq",
+    };
+
+    await client.query(
+      `
+      INSERT INTO documents (id, url, content, meta)
+      VALUES ($1, $2, $3, $4)
+    `,
+      [docId, url ?? null, fullText, meta]
+    );
+
+    // 4) chunk the text
+    const chunks = chunkText(fullText, 1500);
+
+    // 5) insert chunks – WITHOUT meta, WITHOUT embedding (NULL)
+    for (const chunk of chunks) {
+      const chunkId = uuidv4();
+      await client.query(
+        `
+        INSERT INTO document_chunks (id, document_id, content, embedding)
+        VALUES ($1, $2, $3, $4)
+      `,
+        [chunkId, docId, chunk, null]
+      );
+    }
+
     await client.end();
+
     return NextResponse.json(
-      { ok: false, error: "Nothing ingested" },
-      { status: 400 }
+      {
+        ok: true,
+        message: "Ingestion complete",
+        docId,
+        chunks: chunks.length,
+        source: meta.source,
+      },
+      { status: 200 }
     );
   } catch (err: any) {
     console.error("Ingest error:", err);
-    try {
-      await new Client({ connectionString: process.env.SUPABASE_CONN! }).end();
-    } catch (e) {
-      // ignore
-    }
+    await client.end();
     return NextResponse.json(
       { ok: false, error: String(err?.message || err) },
       { status: 500 }
     );
-  } finally {
-    //  this is the fix for the pool-limits issue
-    await client.end();
   }
 }

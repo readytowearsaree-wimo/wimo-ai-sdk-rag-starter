@@ -193,5 +193,8 @@ export async function POST(req: Request) {
       { ok: false, error: String(err?.message || err) },
       { status: 500 }
     );
+  } finally {
+    //  this is the fix for the pool-limits issue
+    await client.end();
   }
 }

@@ -12,7 +12,9 @@ export async function POST(req: Request) {
   let finalResponse: any = null;
 
   try {
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+    console.log("Incoming ingestion request");
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const SUPABASE_CONN = process.env.SUPABASE_CONN;
 
     if (!OPENAI_API_KEY || !SUPABASE_CONN) {
@@ -28,6 +30,7 @@ export async function POST(req: Request) {
 
     // read body
     const body = await req.json();
+console.log("Body received:", body);
     const text = body.text as string | undefined;
     const url = body.url as string | undefined;
     const sourceBucket =
@@ -43,6 +46,9 @@ export async function POST(req: Request) {
 
       // insert into documents
       await client.query(
+console.log("Inserting document to Supabase");
+console.log("Creating embeddings for chunk");
+
         `INSERT INTO documents (id, url, content, meta)
          VALUES ($1, $2, $3, $4)`,
         [docId, fakeUrl, text, JSON.stringify({ source: sourceBucket })]
@@ -65,6 +71,9 @@ export async function POST(req: Request) {
         const embedding = embeddingRes.data[0].embedding;
 
         await client.query(
+console.log("Inserting document to Supabase");
+console.log("Creating embeddings for chunk");
+
           `INSERT INTO document_chunks
             (id, document_id, content, embedding, meta)
             VALUES ($1, $2, $3, $4, $5)`,
@@ -109,6 +118,9 @@ export async function POST(req: Request) {
       const docId = uuidv4();
 
       await client.query(
+console.log("Inserting document to Supabase");
+console.log("Creating embeddings for chunk");
+
         `INSERT INTO documents (id, url, content, meta)
          VALUES ($1, $2, $3, $4)`,
         [docId, url, pageText, JSON.stringify({ source: sourceBucket })]
@@ -129,6 +141,9 @@ export async function POST(req: Request) {
         const embedding = embeddingRes.data[0].embedding;
 
         await client.query(
+console.log("Inserting document to Supabase");
+console.log("Creating embeddings for chunk");
+
           `INSERT INTO document_chunks
             (id, document_id, content, embedding, meta)
             VALUES ($1, $2, $3, $4, $5)`,

@@ -46,13 +46,12 @@ console.log("Body received:", body);
 
       // insert into documents
       await client.query(
-console.log("Inserting document to Supabase");
-console.log("Creating embeddings for chunk");
-
         `INSERT INTO documents (id, url, content, meta)
          VALUES ($1, $2, $3, $4)`,
         [docId, fakeUrl, text, JSON.stringify({ source: sourceBucket })]
       );
+console.log("Inserting document to Supabase");
+console.log("Creating embeddings for chunk");
 
       // now split text into chunks (very simple split; you can improve later)
       const MAX_CHARS = 1800;
@@ -71,9 +70,6 @@ console.log("Creating embeddings for chunk");
         const embedding = embeddingRes.data[0].embedding;
 
         await client.query(
-console.log("Inserting document to Supabase");
-console.log("Creating embeddings for chunk");
-
           `INSERT INTO document_chunks
             (id, document_id, content, embedding, meta)
             VALUES ($1, $2, $3, $4, $5)`,
@@ -85,6 +81,9 @@ console.log("Creating embeddings for chunk");
             JSON.stringify({ source: sourceBucket }),
           ]
         );
+console.log("Inserting document to Supabase");
+console.log("Creating embeddings for chunk");
+
       }
 
       await client.end();
@@ -118,13 +117,12 @@ console.log("Creating embeddings for chunk");
       const docId = uuidv4();
 
       await client.query(
-console.log("Inserting document to Supabase");
-console.log("Creating embeddings for chunk");
-
         `INSERT INTO documents (id, url, content, meta)
          VALUES ($1, $2, $3, $4)`,
         [docId, url, pageText, JSON.stringify({ source: sourceBucket })]
       );
+console.log("Inserting document to Supabase");
+console.log("Creating embeddings for chunk");
 
       // simple chunking
       const MAX_CHARS = 1800;
@@ -141,9 +139,6 @@ console.log("Creating embeddings for chunk");
         const embedding = embeddingRes.data[0].embedding;
 
         await client.query(
-console.log("Inserting document to Supabase");
-console.log("Creating embeddings for chunk");
-
           `INSERT INTO document_chunks
             (id, document_id, content, embedding, meta)
             VALUES ($1, $2, $3, $4, $5)`,
@@ -155,6 +150,9 @@ console.log("Creating embeddings for chunk");
             JSON.stringify({ source: sourceBucket }),
           ]
         );
+console.log("Inserting document to Supabase");
+console.log("Creating embeddings for chunk");
+
       }
 
       await client.end();

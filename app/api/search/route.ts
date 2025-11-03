@@ -5,13 +5,11 @@ import pkg from "pg";
 
 const { Client } = pkg;
 
-// looser so long FAQs still match
 const FAQ_MIN_SIM = 0.55;
 const MAX_RETURN = 3;
 const REVIEW_GOOGLE_URL =
   "https://www.google.com/search?q=wimo+ready+to+wear+saree+reviews";
 
-// phrases that mean "order/delivery" — used to rescue that FAQ
 const ORDER_KEYWORDS = [
   "order",
   "delivery",
@@ -32,7 +30,6 @@ function normalize(str: string) {
     .trim();
 }
 
-// for reviews: basic word overlap score
 function scoreReview(reviewText: string, query: string): number {
   const q = normalize(query).split(" ").filter(Boolean);
   const r = normalize(reviewText);
@@ -43,7 +40,6 @@ function scoreReview(reviewText: string, query: string): number {
   return hits;
 }
 
-// parse the review we ingested (Reviewer:..., Rating:..., Date:..., Review:...)
 function parseReviewText(raw: string) {
   const out: {
     reviewer?: string;
@@ -72,7 +68,6 @@ function parseReviewText(raw: string) {
     }
   }
 
-  // actual text
   const reviewLine = lines.find(
     (l) => l.toLowerCase().startsWith("review:") || l.toLowerCase().startsWith("comment:")
   );
@@ -85,44 +80,15 @@ function parseReviewText(raw: string) {
   return out;
 }
 
-// figure out if row is FAQ or google-review
-function dbRowToSource(row: any): "faq" | "google-review" | "unknown" {
-  const m = row.meta || {};
-  const d = row.doc_meta || {};
-  const source =
-    m.source ||
-    m.type ||
-    m.sourceBucket ||
-    d.source ||
-    d.type ||
-    d.sourceBucket ||
-    row.sourceBucket ||
-    "faq";
-
-  if (source === "google-review") return "google-review";
-  if (source === "faq") return "faq";
-  return "unknown";
+function json(obj: any, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Content-Type": "application/json",
+    },
+  });
 }
-
-// fallback reviews in memory (used only if DB has no review rows)
-const FALLBACK_REVIEWS = [
-  {
-    text: "Loved the ready to wear saree! The fit and finishing were amazing.",
-    date: "2025-10-21",
-  },
-  {
-    text: "Excellent service, they even customized the saree to my measurements.",
-    date: "2025-09-29",
-  },
-  {
-    text: "Delivery was super quick and the saree draped beautifully!",
-    date: "2025-09-15",
-  },
-  {
-    text: "Very comfortable fabric. I’ll definitely buy again!",
-    date: "2025-09-10",
-  },
-];
 
 // CORS preflight
 export async function OPTIONS() {
@@ -145,7 +111,6 @@ export async function POST(req: Request) {
     const body = await req.json().catch(() => ({}));
     const query = (body?.query ?? "").toString().trim();
     const askDebug = !!body?.debug;
-    const topK = Math.min(Math.max(Number(body?.topK ?? 12), 1), 30);
 
     if (!query) {
       return json({ ok: false, error: "Missing 'query'" }, 400);
@@ -169,11 +134,12 @@ export async function POST(req: Request) {
     const queryEmbedding = emb.data[0].embedding;
     const vecLiteral = `[${queryEmbedding.join(",")}]`;
 
-    // 2) fetch chunks from Postgres
+    // 2) connect once
     const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
 
-    const sql = `
+    // 2a) FAQs: rows that DO have embeddings
+    const sqlFaq = `
       select
         dc.document_id,
         d.url,
@@ -185,56 +151,52 @@ export async function POST(req: Request) {
       join documents d on d.id = dc.document_id
       where dc.embedding is not null
       order by dc.embedding <=> $1::vector
-      limit $2;
+      limit 50;
     `;
+    const { rows: faqRows } = await client.query(sqlFaq, [vecLiteral]);
 
-    const { rows } = await client.query(sql, [vecLiteral, topK]);
+    // 2b) Reviews: rows that are google-review, EVEN IF embedding is null
+    const sqlReviews = `
+      select
+        dc.document_id,
+        d.url,
+        d.meta,
+        dc.chunk_index,
+        dc.content,
+        dc.created_at
+      from document_chunks dc
+      join documents d on d.id = dc.document_id
+      where (d.meta->>'source') = 'google-review'
+      order by dc.created_at desc
+      limit 200;
+    `;
+    const { rows: reviewRows } = await client.query(sqlReviews);
+
     await client.end();
 
-    // 3) normalize + parse
-    const enriched = rows.map((r: any) => {
-      const source = dbRowToSource(r);
-      const base = {
-        document_id: r.document_id,
-        url: r.url,
-        source,
-        chunk_index: r.chunk_index,
-        content: r.content,
-        similarity: Number(r.similarity),
-      };
+    // 3) FAQ logic
+    let faqHits = faqRows
+      .filter((r: any) => {
+        const m = r.meta || {};
+        const source =
+          m.source || m.type || m.sourceBucket || "faq";
+        return source === "faq" && Number(r.similarity) >= FAQ_MIN_SIM;
+      })
+      .slice(0, 3);
 
-      if (source === "google-review") {
-        const parsed = parseReviewText(r.content || "");
-        return {
-          ...base,
-          review: {
-            reviewer: parsed.reviewer || null,
-            rating: parsed.rating || null,
-            date: parsed.date || null,
-            text: parsed.review || parsed.raw,
-            sourceUrl: parsed.sourceUrl || null,
-          },
-        };
-      }
-
-      return base;
-    });
-
-    // ========== FAQ PART ==========
-    let faqHits = enriched
-      .filter((r: any) => r.source === "faq" && r.similarity >= FAQ_MIN_SIM)
-      .slice(0, MAX_RETURN);
-
-    // rescue for order/delivery queries
+    // rescue order/delivery
     if (faqHits.length === 0) {
       const normQ = normalize(query);
       const looksLikeOrder = ORDER_KEYWORDS.some((kw) =>
         normQ.includes(kw)
       );
-
       if (looksLikeOrder) {
-        const orderLike = enriched
-          .filter((r: any) => r.source === "faq")
+        const orderLike = faqRows
+          .filter((r: any) => {
+            const m = r.meta || {};
+            const source = m.source || m.type || m.sourceBucket || "faq";
+            return source === "faq";
+          })
           .map((r: any) => {
             const score = ORDER_KEYWORDS.reduce((acc, kw) => {
               return acc + (normalize(r.content).includes(kw) ? 1 : 0);
@@ -244,7 +206,6 @@ export async function POST(req: Request) {
           .filter((r: any) => r.orderScore > 0)
           .sort((a: any, b: any) => b.orderScore - a.orderScore)
           .slice(0, 1);
-
         if (orderLike.length > 0) {
           faqHits = orderLike;
         }
@@ -255,63 +216,66 @@ export async function POST(req: Request) {
       found: faqHits.length > 0,
       items: faqHits.map((r: any) => ({
         content: r.content,
-        similarity: r.similarity,
+        similarity: Number(r.similarity),
         source: "faq" as const,
         url: r.url || null,
       })),
     };
 
-    // ========== REVIEWS PART ==========
-    // real DB reviews
-    const dbReviewsRaw = enriched.filter(
-      (r: any) => r.source === "google-review"
-    );
-
+    // 4) REVIEW logic — now from real DB rows
     let reviewItems: any[] = [];
-
-    if (dbReviewsRaw.length > 0) {
-      // score by query overlap
-      reviewItems = dbReviewsRaw
+    if (reviewRows.length > 0) {
+      reviewItems = reviewRows
         .map((r: any) => {
-          const textForScore = r.review?.text || r.content || "";
-          const sc = scoreReview(textForScore, query);
-          return { ...r, __score: sc };
+          const parsed = parseReviewText(r.content || "");
+          const score = scoreReview(parsed.review || parsed.raw, query);
+          return {
+            ...r,
+            parsed,
+            __score: score,
+          };
         })
+        // get best match for THIS question
         .sort((a: any, b: any) => b.__score - a.__score)
         .slice(0, 3)
         .map((r: any) => ({
           source: "google-review",
-          reviewer: r.review?.reviewer || null,
-          rating: r.review?.rating || null,
-          date: r.review?.date || null,
-          text: r.review?.text || r.content,
-          sourceUrl: r.review?.sourceUrl || null,
+          reviewer: r.parsed.reviewer || null,
+          rating: r.parsed.rating || null,
+          date: r.parsed.date || null,
+          text: r.parsed.review || r.parsed.raw,
+          sourceUrl: r.parsed.sourceUrl || REVIEW_GOOGLE_URL,
         }));
     } else {
-      // fallback to in-memory ones
-      reviewItems = FALLBACK_REVIEWS
-        .map((r) => ({
-          ...r,
-          __score: scoreReview(r.text, query),
-        }))
-        .sort((a, b) => b.__score - a.__score)
-        .slice(0, 3)
-        .map((r) => ({
+      // fallback — only if DB truly has none
+      reviewItems = [
+        {
           source: "google-review",
           reviewer: null,
           rating: null,
-          date: r.date,
-          text: r.text,
+          date: "2025-10-21",
+          text: "Loved the ready to wear saree! The fit and finishing were amazing.",
           sourceUrl: REVIEW_GOOGLE_URL,
-        }));
+        },
+        {
+          source: "google-review",
+          reviewer: null,
+          rating: null,
+          date: "2025-09-29",
+          text: "Excellent service, they even customized the saree to my measurements.",
+          sourceUrl: REVIEW_GOOGLE_URL,
+        },
+        {
+          source: "google-review",
+          reviewer: null,
+          rating: null,
+          date: "2025-09-15",
+          text: "Delivery was super quick and the saree draped beautifully!",
+          sourceUrl: REVIEW_GOOGLE_URL,
+        },
+      ];
     }
 
-    const reviewsBlock = {
-      items: reviewItems,
-      googleLink: REVIEW_GOOGLE_URL,
-    };
-
-    // final shape — ALWAYS send faq + reviews
     return json(
       {
         ok: true,
@@ -322,8 +286,18 @@ export async function POST(req: Request) {
           ? "google-review"
           : "none",
         faq: faqBlock,
-        reviews: reviewsBlock,
-        ...(askDebug ? { debug: { top: enriched.slice(0, 8) } } : {}),
+        reviews: {
+          items: reviewItems,
+          googleLink: REVIEW_GOOGLE_URL,
+        },
+        ...(askDebug
+          ? {
+              debug: {
+                faqTop: faqRows.slice(0, 10),
+                reviewTop: reviewRows.slice(0, 10),
+              },
+            }
+          : {}),
       },
       200
     );
@@ -331,15 +305,4 @@ export async function POST(req: Request) {
     console.error("Search error:", err);
     return json({ ok: false, error: String(err?.message || err) }, 500);
   }
-}
-
-// helper to always send CORS
-function json(obj: any, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Content-Type": "application/json",
-    },
-  });
 }

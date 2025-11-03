@@ -1,209 +1,182 @@
 // app/api/search/route.ts
 import OpenAI from "openai";
 import pkg from "pg";
-
 const { Client } = pkg;
 
-// ---- Tuning ----
-const FAQ_MIN_SIM = 0.55;        // similarity gate for FAQ
+const FAQ_MIN_SIM = 0.55;
 const MAX_FAQ_RETURN = 3;
-const MAX_REVIEW_RETURN = 3;
 const REVIEW_GOOGLE_URL =
   "https://www.google.com/search?q=wimo+ready+to+wear+saree+reviews";
 
-// ---- Helpers ----
+const ORDER_KEYWORDS = [
+  "order","delivery","when will i get","where is my order","track my order",
+  "status","pickup","courier","delayed",
+];
+
 function normalize(s: string) {
   return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 }
 function textMatchScore(text: string, query: string) {
   const qWords = normalize(query).split(" ").filter(Boolean);
   const t = normalize(text);
-  let score = 0;
-  for (const w of qWords) if (t.includes(w)) score += 1;
+  let score = 0; for (const w of qWords) if (t.includes(w)) score += 1;
   return score;
 }
-
-// Try to pull reviewer / rating / date out of your “Google review” rows
 function parseReviewText(raw: string) {
-  const out: { reviewer?: string|null; rating?: number|null; date?: string|null; text: string } = {
-    reviewer: null, rating: null, date: null, text: (raw || "").trim()
-  };
+  const out: any = { raw };
   if (!raw) return out;
-
-  const txt = raw.replace(/\r/g, "");
-
-  // reviewer → supports lines like:
-  //   Reviewer: {'displayName': 'Prajna Kirtane'}
-  //   displayName: 'Sabitha AM'
-  const mName =
-    /displayName['"]?\s*[:=]\s*['"]([^'"]+)['"]/i.exec(txt) ||
-    /reviewer\s*:\s*['"]?([A-Za-z][^'"\n]+?)['"]?(?:\n|$)/i.exec(txt);
-  if (mName) out.reviewer = mName[1].trim();
-
-  // rating → “Rating: 4.8”, or “4.5/5”
-  const mRating =
-    /rating\s*[:\-]?\s*(\d+(?:\.\d+)?)/i.exec(txt) ||
-    /([0-5](?:\.\d+)?)\s*\/\s*5/i.exec(txt);
-  out.rating = mRating ? Number(mRating[1]) : null;
-
-  // date → prefer ISO like 2025-10-21, else `Date: ...`
-  const mIso = /\b(20\d{2}-\d{2}-\d{2})\b/.exec(txt) ||
-               /date\s*[:\-]?\s*([^\n]+)\n?/i.exec(txt);
-  out.date = mIso ? mIso[1].trim() : null;
-
-  // review body → “Review: …” or keep raw
-  const mReview = /(?:^|\n)\s*(?:review|comment)\s*:\s*([\s\S]+)$/i.exec(txt);
-  if (mReview) out.text = mReview[1].trim();
-
+  const lines = raw.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+  for (const line of lines) {
+    if (line.toLowerCase().startsWith("reviewer:")) out.reviewer = line.split(":").slice(1).join(":").trim();
+    else if (line.toLowerCase().startsWith("rating:")) {
+      const n = Number(line.replace(/rating:/i,"").trim()); if (!Number.isNaN(n)) out.rating = n;
+    } else if (line.toLowerCase().startsWith("date:")) out.date = line.replace(/date:/i,"").trim();
+  }
+  const rLine = lines.find(l => l.toLowerCase().startsWith("review:") || l.toLowerCase().startsWith("comment:"));
+  out.review = rLine ? rLine.split(":").slice(1).join(":").trim() : raw.trim();
   return out;
 }
-
-// Small JSON helper with CORS
-function json(obj: any, status = 200) {
-  return new Response(JSON.stringify(obj), {
+function json(obj:any, status=200){
+  return new Response(JSON.stringify(obj),{
     status,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Content-Type": "application/json",
-    },
+    headers:{
+      "Access-Control-Allow-Origin":"*",
+      "Content-Type":"application/json",
+    }
   });
 }
 
-// ---- CORS / health ----
-export async function OPTIONS() {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    },
-  });
-}
-export async function GET() {
-  return json({ ok: true, msg: "search route is alive" });
-}
+// CORS
+export async function OPTIONS(){ return new Response(null,{status:204,headers:{
+  "Access-Control-Allow-Origin":"*",
+  "Access-Control-Allow-Methods":"GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers":"Content-Type, Authorization",
+}}); }
+export async function GET(){ return json({ok:true,msg:"search route is alive"},200); }
 
-// ---- Main ----
-export async function POST(req: Request) {
-  try {
-    const body = await req.json().catch(() => ({}));
+export async function POST(req: Request){
+  try{
+    const body = await req.json().catch(()=>({}));
     const query = (body?.query ?? "").toString().trim();
-    const topK = Math.min(Math.max(Number(body?.topK ?? 12), 1), 30);
-
-    if (!query) return json({ ok: false, error: "Missing 'query'" }, 400);
+    const topK  = Math.min(Math.max(Number(body?.topK ?? 14),1),40);
+    const askDebug = !!body?.debug;
+    if(!query) return json({ok:false,error:"Missing 'query'"},400);
 
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    const SUPABASE_CONN = process.env.SUPABASE_CONN;
-    if (!OPENAI_API_KEY || !SUPABASE_CONN) {
-      return json({ ok: false, error: "Missing OPENAI_API_KEY or SUPABASE_CONN" }, 500);
-    }
+    const SUPABASE_CONN  = process.env.SUPABASE_CONN;
+    if(!OPENAI_API_KEY || !SUPABASE_CONN) return json({ok:false,error:"Missing OPENAI_API_KEY or SUPABASE_CONN"},500);
 
-    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+    // 1) Embed ONLY for FAQ vector search
+    const openai = new OpenAI({apiKey:OPENAI_API_KEY});
+    const emb = await openai.embeddings.create({ model:"text-embedding-3-small", input: query });
+    const vecLiteral = `[${emb.data[0].embedding.join(",")}]`;
 
-    // 1) Query embedding
-    const emb = await openai.embeddings.create({
-      model: "text-embedding-3-small",
-      input: query,
-    });
-    const queryEmbedding = emb.data[0].embedding;
-    const vec = `[${queryEmbedding.join(",")}]`;
-
-    const client = new Client({ connectionString: SUPABASE_CONN });
+    const client = new Client({connectionString: SUPABASE_CONN});
     await client.connect();
 
-    // 2) FAQ via vector search (only FAQ rows)
-    const faqSql = `
-      SELECT dc.document_id, d.url, d.meta AS doc_meta, dc.chunk_index, dc.content,
-             1 - (dc.embedding <=> $1::vector) AS similarity
-      FROM document_chunks dc
-      JOIN documents d ON d.id = dc.document_id
-      WHERE (d.meta->>'source') = 'faq' AND dc.embedding IS NOT NULL
-      ORDER BY dc.embedding <=> $1::vector
-      LIMIT $2;
+    // 2a) FAQ by vectors (requires embedding)
+    const sqlFaq = `
+      select dc.document_id, d.url, d.meta, dc.chunk_index, dc.content,
+             1 - (dc.embedding <=> $1::vector) as similarity
+      from document_chunks dc
+      join documents d on d.id = dc.document_id
+      where dc.embedding is not null
+      order by dc.embedding <=> $1::vector
+      limit $2;
     `;
-    const faqRes = await client.query(faqSql, [vec, topK]);
+    const { rows: faqRows } = await client.query(sqlFaq, [vecLiteral, topK]);
 
-    // 3) Google-reviews:
-    // 3a) Prefer vector search if embeddings exist for reviews
-    const revVecSql = `
-      SELECT dc.document_id, d.url, d.meta AS doc_meta, dc.chunk_index, dc.content,
-             1 - (dc.embedding <=> $1::vector) AS similarity
-      FROM document_chunks dc
-      JOIN documents d ON d.id = dc.document_id
-      WHERE (d.meta->>'source') = 'google-review' AND dc.embedding IS NOT NULL
-      ORDER BY dc.embedding <=> $1::vector
-      LIMIT $2;
+    // 2b) Reviews WITHOUT vectors (works when embedding is NULL)
+    // We rely on the *document* meta having source = 'google-review'
+    const sqlReviews = `
+      select dc.document_id, d.url, d.meta, dc.chunk_index, dc.content
+      from document_chunks dc
+      join documents d on d.id = dc.document_id
+      where (d.meta->>'source') = 'google-review'
+      order by dc.id desc
+      limit 600;
     `;
-    const revVecRes = await client.query(revVecSql, [vec, topK]);
-
-    // 3b) Fallback keyword search if no review embeddings yet
-    let revKeyRes = { rows: [] as any[] };
-    if (revVecRes.rows.length === 0) {
-      // build loose ILIKE clause from first few meaningful words
-      const words = normalize(query).split(" ").filter(w => w.length > 2).slice(0, 5);
-      const likeConds = words.map((_, i) => `dc.content ILIKE $${i + 3}`).join(" OR ") || "TRUE";
-      const params = [vec, topK, ...words.map(w => `%${w}%`)];
-      const revKeySql = `
-        SELECT dc.document_id, d.url, d.meta AS doc_meta, dc.chunk_index, dc.content,
-               0.0 AS similarity
-        FROM document_chunks dc
-        JOIN documents d ON d.id = dc.document_id
-        WHERE (d.meta->>'source') = 'google-review'
-          AND (${likeConds})
-        LIMIT $2;
-      `;
-      revKeyRes = await client.query(revKeySql, params);
-    }
-
+    const { rows: reviewRowsRaw } = await client.query(sqlReviews, []);
     await client.end();
 
-    // Format FAQ
-    const faqHits = faqRes.rows
-      .filter(r => Number(r.similarity) >= FAQ_MIN_SIM)
-      .slice(0, MAX_FAQ_RETURN)
-      .map(r => ({
-        content: r.content,
-        similarity: Number(r.similarity),
-        source: "faq",
-      }));
+    // 3) shape
+    const faqs = faqRows
+      .filter((r:any) => (r.meta?.source ?? r.meta?.type ?? "faq") === "faq")
+      .map((r:any)=>({ content:r.content, similarity:Number(r.similarity) }));
 
-    // Parse & score reviews (from whichever branch returned rows)
-    const reviewRows = (revVecRes.rows.length ? revVecRes.rows : revKeyRes.rows) as any[];
+    // guarantee at least one FAQ if any exist
+    let faqHits = faqs.filter((f:any)=>f.similarity >= FAQ_MIN_SIM).slice(0,MAX_FAQ_RETURN);
+    if (faqHits.length===0 && faqs.length>0){
+      const looksOrder = ORDER_KEYWORDS.some(kw => normalize(query).includes(kw));
+      if (looksOrder){
+        // crude rescue: pick the first FAQ that mentions any order keyword
+        const orderLike = faqRows
+          .filter((r:any)=> (r.meta?.source ?? "faq")==="faq")
+          .map((r:any)=>({ ...r, score: ORDER_KEYWORDS.reduce((a,kw)=>a+(normalize(r.content).includes(kw)?1:0),0)}))
+          .filter((r:any)=>r.score>0)
+          .sort((a:any,b:any)=>b.score-a.score);
+        if (orderLike.length>0) {
+          faqHits = [{ content: orderLike[0].content, similarity: Number(orderLike[0].similarity) }];
+        } else {
+          faqHits = [{ content: faqs[0].content, similarity: faqs[0].similarity }];
+        }
+      } else {
+        faqHits = [{ content: faqs[0].content, similarity: faqs[0].similarity }];
+      }
+    }
 
-    const parsedReviews = reviewRows.map(r => {
-      const parsed = parseReviewText(r.content || "");
-      const createdAt = (r.created_at ? Date.parse(r.created_at) : 0) || 0;
+    // Reviews: parse & score lexically
+    const parsedReviews = reviewRowsRaw.map((r:any)=>{
+      const p = parseReviewText(r.content||"");
       return {
-        reviewer: parsed.reviewer ?? null,
-        rating: parsed.rating ?? null,
-        date: parsed.date ?? null,
-        text: parsed.text,
-        _recency: createdAt,
+        reviewer: p.reviewer || null,
+        rating:   p.rating ?? null,
+        date:     p.date   || null,
+        text:     p.review || r.content || "",
       };
     });
 
-    const reviews = parsedReviews
-      .map((rv, i) => ({
-        ...rv,
-        _score: textMatchScore(rv.text, query) + Math.max(0, 5 - i) * 0.2,
-      }))
-      .filter(rv => rv._score > 0)
-      .sort((a, b) => b._score - a._score)
-      .slice(0, MAX_REVIEW_RETURN)
-      .map(({ reviewer, rating, date, text }) => ({ reviewer, rating, date, text }));
+    const relatedReviews = parsedReviews
+      .map((rv:any, idx:number)=> ({ ...rv, __score: textMatchScore(rv.text, query) + Math.max(0,5-idx)*0.2 }))
+      .filter((rv:any)=> rv.__score > 0)
+      .sort((a:any,b:any)=> b.__score - a.__score)
+      .slice(0,3)
+      .map(({reviewer,rating,date,text}:any)=>({reviewer,rating,date,text}));
 
-    // Response contains BOTH sections so the UI can render FAQ first, then reviews
+    // Build response
+    if (faqHits.length>0){
+      return json({
+        ok:true,
+        query,
+        source:"faq",
+        results: faqHits,
+        relatedReviews,
+        reviewLink: REVIEW_GOOGLE_URL,
+        ...(askDebug? {debug:{faqCount:faqs.length, reviewCount:parsedReviews.length}} : {}),
+      });
+    }
+
+    if (relatedReviews.length>0){
+      return json({
+        ok:true,
+        query,
+        source:"google-review",
+        results: relatedReviews,
+        reviewLink: REVIEW_GOOGLE_URL
+      });
+    }
+
     return json({
-      ok: true,
+      ok:true,
       query,
-      sources: { faq: "faq", reviews: "google-review" },
-      faq: faqHits,                    // array
-      reviews,                         // array
-      reviewLink: REVIEW_GOOGLE_URL,   // always include link
+      source:"none",
+      results: [],
+      reviewLink: REVIEW_GOOGLE_URL,
+      message:"I couldn’t find this in FAQs or reviews.",
     });
-  } catch (err: any) {
+
+  }catch(err:any){
     console.error("Search error:", err);
-    return json({ ok: false, error: String(err?.message || err) }, 500);
+    return json({ok:false,error:String(err?.message||err)},500);
   }
 }

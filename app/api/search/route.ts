@@ -1,15 +1,16 @@
 // app/api/search/route.ts
-import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import pkg from "pg";
 
 const { Client } = pkg;
 
+// loosened a bit because some of your FAQs are long
 const FAQ_MIN_SIM = 0.55;
-const MAX_RETURN = 3;
+const MAX_FAQ_RETURN = 3;
 const REVIEW_GOOGLE_URL =
   "https://www.google.com/search?q=wimo+ready+to+wear+saree+reviews";
 
+// words that clearly indicate the “order / delivery / track” FAQ
 const ORDER_KEYWORDS = [
   "order",
   "delivery",
@@ -30,14 +31,17 @@ function normalize(str: string) {
     .trim();
 }
 
-function scoreReview(reviewText: string, query: string): number {
-  const q = normalize(query).split(" ").filter(Boolean);
-  const r = normalize(reviewText);
-  let hits = 0;
-  for (const word of q) {
-    if (r.includes(word)) hits += 1;
+// for reviews: quick lexical score
+function textMatchScore(text: string, query: string) {
+  const qWords = normalize(query)
+    .split(" ")
+    .filter(Boolean);
+  const t = normalize(text);
+  let score = 0;
+  for (const w of qWords) {
+    if (t.includes(w)) score += 1;
   }
-  return hits;
+  return score;
 }
 
 function parseReviewText(raw: string) {
@@ -52,24 +56,28 @@ function parseReviewText(raw: string) {
 
   if (!raw) return out;
 
-  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
 
   for (const line of lines) {
-    const low = line.toLowerCase();
-    if (low.startsWith("reviewer:")) {
+    if (line.toLowerCase().startsWith("reviewer:")) {
       out.reviewer = line.split(":").slice(1).join(":").trim();
-    } else if (low.startsWith("rating:")) {
+    } else if (line.toLowerCase().startsWith("rating:")) {
       const num = Number(line.replace(/rating:/i, "").trim());
       if (!Number.isNaN(num)) out.rating = num;
-    } else if (low.startsWith("date:")) {
+    } else if (line.toLowerCase().startsWith("date:")) {
       out.date = line.replace(/date:/i, "").trim();
-    } else if (low.startsWith("source:")) {
+    } else if (line.toLowerCase().startsWith("source:")) {
       out.sourceUrl = line.replace(/source:/i, "").trim();
     }
   }
 
   const reviewLine = lines.find(
-    (l) => l.toLowerCase().startsWith("review:") || l.toLowerCase().startsWith("comment:")
+    (l) =>
+      l.toLowerCase().startsWith("review:") ||
+      l.toLowerCase().startsWith("comment:")
   );
   if (reviewLine) {
     out.review = reviewLine.split(":").slice(1).join(":").trim();
@@ -80,14 +88,21 @@ function parseReviewText(raw: string) {
   return out;
 }
 
-function json(obj: any, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Content-Type": "application/json",
-    },
-  });
+function dbRowToSource(row: any): "faq" | "google-review" | "unknown" {
+  const m = row.meta || {};
+  const d = row.doc_meta || {};
+  const source =
+    m.source ||
+    m.type ||
+    m.sourceBucket ||
+    d.source ||
+    d.type ||
+    d.sourceBucket ||
+    row.sourceBucket ||
+    "faq"; // default to faq so FAQs without meta still work
+  if (source === "google-review") return "google-review";
+  if (source === "faq") return "faq";
+  return "unknown";
 }
 
 // CORS preflight
@@ -103,13 +118,20 @@ export async function OPTIONS() {
 }
 
 export async function GET() {
-  return json({ ok: true, msg: "search route is alive" }, 200);
+  return new Response(JSON.stringify({ ok: true, msg: "search route is alive" }), {
+    status: 200,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Content-Type": "application/json",
+    },
+  });
 }
 
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
     const query = (body?.query ?? "").toString().trim();
+    const topK = Math.min(Math.max(Number(body?.topK ?? 14), 1), 40);
     const askDebug = !!body?.debug;
 
     if (!query) {
@@ -125,7 +147,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 1) embed query
+    // 1) embed
     const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
     const emb = await openai.embeddings.create({
       model: "text-embedding-3-small",
@@ -134,12 +156,11 @@ export async function POST(req: Request) {
     const queryEmbedding = emb.data[0].embedding;
     const vecLiteral = `[${queryEmbedding.join(",")}]`;
 
-    // 2) connect once
+    // 2) PG
     const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
 
-    // 2a) FAQs: rows that DO have embeddings
-    const sqlFaq = `
+    const sql = `
       select
         dc.document_id,
         d.url,
@@ -151,153 +172,133 @@ export async function POST(req: Request) {
       join documents d on d.id = dc.document_id
       where dc.embedding is not null
       order by dc.embedding <=> $1::vector
-      limit 50;
+      limit $2;
     `;
-    const { rows: faqRows } = await client.query(sqlFaq, [vecLiteral]);
-
-    // 2b) Reviews: rows that are google-review, EVEN IF embedding is null
-    const sqlReviews = `
-      select
-        dc.document_id,
-        d.url,
-        d.meta,
-        dc.chunk_index,
-        dc.content,
-        dc.created_at
-      from document_chunks dc
-      join documents d on d.id = dc.document_id
-      where (d.meta->>'source') = 'google-review'
-      order by dc.created_at desc
-      limit 200;
-    `;
-    const { rows: reviewRows } = await client.query(sqlReviews);
-
+    const { rows } = await client.query(sql, [vecLiteral, topK]);
     await client.end();
 
-    // 3) FAQ logic
-    let faqHits = faqRows
-      .filter((r: any) => {
-        const m = r.meta || {};
-        const source =
-          m.source || m.type || m.sourceBucket || "faq";
-        return source === "faq" && Number(r.similarity) >= FAQ_MIN_SIM;
-      })
-      .slice(0, 3);
+    // 3) normalize rows
+    const enriched = rows.map((r: any) => {
+      const source = dbRowToSource(r);
+      const base: any = {
+        document_id: r.document_id,
+        url: r.url,
+        source,
+        chunk_index: r.chunk_index,
+        content: r.content,
+        similarity: Number(r.similarity),
+      };
+      if (source === "google-review") {
+        const parsed = parseReviewText(r.content || "");
+        base.review = {
+          reviewer: parsed.reviewer || null,
+          rating: parsed.rating || null,
+          date: parsed.date || null,
+          text: parsed.review || parsed.raw,
+          sourceUrl: parsed.sourceUrl || null,
+        };
+      }
+      return base;
+    });
 
-    // rescue order/delivery
-    if (faqHits.length === 0) {
+    // 4) pick FAQ — guarantee at least one if any FAQ exists
+    const allFaqs = enriched.filter((r) => r.source === "faq");
+    // first try by similarity
+    let faqHits = allFaqs.filter((r) => r.similarity >= FAQ_MIN_SIM);
+    faqHits = faqHits.slice(0, MAX_FAQ_RETURN);
+
+    // rescue: if none passed threshold but we DO have FAQ rows, take the first one
+    if (faqHits.length === 0 && allFaqs.length > 0) {
+      // special rescue for order/delivery
       const normQ = normalize(query);
       const looksLikeOrder = ORDER_KEYWORDS.some((kw) =>
         normQ.includes(kw)
       );
       if (looksLikeOrder) {
-        const orderLike = faqRows
-          .filter((r: any) => {
-            const m = r.meta || {};
-            const source = m.source || m.type || m.sourceBucket || "faq";
-            return source === "faq";
-          })
-          .map((r: any) => {
+        const orderLike = allFaqs
+          .map((r) => {
             const score = ORDER_KEYWORDS.reduce((acc, kw) => {
               return acc + (normalize(r.content).includes(kw) ? 1 : 0);
             }, 0);
             return { ...r, orderScore: score };
           })
-          .filter((r: any) => r.orderScore > 0)
-          .sort((a: any, b: any) => b.orderScore - a.orderScore)
-          .slice(0, 1);
+          .filter((r) => r.orderScore > 0)
+          .sort((a, b) => b.orderScore - a.orderScore);
         if (orderLike.length > 0) {
-          faqHits = orderLike;
+          faqHits = orderLike.slice(0, 1);
+        } else {
+          faqHits = allFaqs.slice(0, 1);
         }
+      } else {
+        // just take the most similar faq even if sim is low
+        faqHits = allFaqs.slice(0, 1);
       }
     }
 
-    const faqBlock = {
-      found: faqHits.length > 0,
-      items: faqHits.map((r: any) => ({
-        content: r.content,
-        similarity: Number(r.similarity),
-        source: "faq" as const,
-        url: r.url || null,
-      })),
-    };
+    // 5) pick related reviews — lexical + recency-ish
+    const reviewRows = enriched.filter((r) => r.source === "google-review");
+    const scoredReviews = reviewRows
+      .map((r: any, idx: number) => {
+        const textForScore = r.review?.text || r.content || "";
+        const s = textMatchScore(textForScore, query);
+        // slight bonus for earlier rows (closer to embedding match)
+        const orderBonus = Math.max(0, 5 - idx); // 5,4,3,2,1,...
+        return { ...r, __score: s + orderBonus * 0.2 };
+      })
+      .filter((r) => r.__score > 0) // only ones that actually matched
+      .sort((a, b) => b.__score - a.__score)
+      .slice(0, 3)
+      .map((r) => ({
+        reviewer: r.review?.reviewer || null,
+        rating: r.review?.rating || null,
+        date: r.review?.date || null,
+        text: r.review?.text || r.content,
+      }));
 
-    // 4) REVIEW logic — now from real DB rows
-    let reviewItems: any[] = [];
-    if (reviewRows.length > 0) {
-      reviewItems = reviewRows
-        .map((r: any) => {
-          const parsed = parseReviewText(r.content || "");
-          const score = scoreReview(parsed.review || parsed.raw, query);
-          return {
-            ...r,
-            parsed,
-            __score: score,
-          };
-        })
-        // get best match for THIS question
-        .sort((a: any, b: any) => b.__score - a.__score)
-        .slice(0, 3)
-        .map((r: any) => ({
-          source: "google-review",
-          reviewer: r.parsed.reviewer || null,
-          rating: r.parsed.rating || null,
-          date: r.parsed.date || null,
-          text: r.parsed.review || r.parsed.raw,
-          sourceUrl: r.parsed.sourceUrl || REVIEW_GOOGLE_URL,
-        }));
-    } else {
-      // fallback — only if DB truly has none
-      reviewItems = [
+    // 6) now build response
+    if (faqHits.length > 0) {
+      return json(
         {
-          source: "google-review",
-          reviewer: null,
-          rating: null,
-          date: "2025-10-21",
-          text: "Loved the ready to wear saree! The fit and finishing were amazing.",
-          sourceUrl: REVIEW_GOOGLE_URL,
+          ok: true,
+          query,
+          source: "faq",
+          results: faqHits.map((r) => ({
+            content: r.content,
+            similarity: r.similarity,
+          })),
+          relatedReviews: scoredReviews, // can be empty
+          reviewLink: REVIEW_GOOGLE_URL,
+          ...(askDebug ? { debug: { top: enriched.slice(0, 10) } } : {}),
         },
-        {
-          source: "google-review",
-          reviewer: null,
-          rating: null,
-          date: "2025-09-29",
-          text: "Excellent service, they even customized the saree to my measurements.",
-          sourceUrl: REVIEW_GOOGLE_URL,
-        },
-        {
-          source: "google-review",
-          reviewer: null,
-          rating: null,
-          date: "2025-09-15",
-          text: "Delivery was super quick and the saree draped beautifully!",
-          sourceUrl: REVIEW_GOOGLE_URL,
-        },
-      ];
+        200
+      );
     }
 
+    // if no FAQ at all, but we do have reviews
+    if (scoredReviews.length > 0) {
+      return json(
+        {
+          ok: true,
+          query,
+          source: "google-review",
+          results: scoredReviews,
+          reviewLink: REVIEW_GOOGLE_URL,
+          ...(askDebug ? { debug: { top: enriched.slice(0, 10) } } : {}),
+        },
+        200
+      );
+    }
+
+    // truly nothing
     return json(
       {
         ok: true,
         query,
-        source: faqBlock.found
-          ? "faq"
-          : reviewItems.length > 0
-          ? "google-review"
-          : "none",
-        faq: faqBlock,
-        reviews: {
-          items: reviewItems,
-          googleLink: REVIEW_GOOGLE_URL,
-        },
-        ...(askDebug
-          ? {
-              debug: {
-                faqTop: faqRows.slice(0, 10),
-                reviewTop: reviewRows.slice(0, 10),
-              },
-            }
-          : {}),
+        source: "none",
+        results: [],
+        reviewLink: REVIEW_GOOGLE_URL,
+        message: "I couldn’t find this in FAQs or reviews.",
+        ...(askDebug ? { debug: { top: enriched.slice(0, 10) } } : {}),
       },
       200
     );
@@ -305,4 +306,15 @@ export async function POST(req: Request) {
     console.error("Search error:", err);
     return json({ ok: false, error: String(err?.message || err) }, 500);
   }
+}
+
+// helper to always send CORS
+function json(obj: any, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Content-Type": "application/json",
+    },
+  });
 }

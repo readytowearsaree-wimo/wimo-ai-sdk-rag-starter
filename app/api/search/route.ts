@@ -5,13 +5,13 @@ import pkg from "pg";
 
 const { Client } = pkg;
 
-// slightly looser
-const FAQ_MIN_SIM = 0.55; // was 0.63 → this helps long FAQs
+// looser so long FAQs still match
+const FAQ_MIN_SIM = 0.55;
 const MAX_RETURN = 3;
 const REVIEW_GOOGLE_URL =
   "https://www.google.com/search?q=wimo+ready+to+wear+saree+reviews";
 
-// words that clearly mean “this is the order/delivery FAQ”
+// phrases that mean "order/delivery" — used to rescue that FAQ
 const ORDER_KEYWORDS = [
   "order",
   "delivery",
@@ -32,6 +32,7 @@ function normalize(str: string) {
     .trim();
 }
 
+// for reviews: basic word overlap score
 function scoreReview(reviewText: string, query: string): number {
   const q = normalize(query).split(" ").filter(Boolean);
   const r = normalize(reviewText);
@@ -42,6 +43,7 @@ function scoreReview(reviewText: string, query: string): number {
   return hits;
 }
 
+// parse the review we ingested (Reviewer:..., Rating:..., Date:..., Review:...)
 function parseReviewText(raw: string) {
   const out: {
     reviewer?: string;
@@ -57,22 +59,22 @@ function parseReviewText(raw: string) {
   const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
 
   for (const line of lines) {
-    if (line.toLowerCase().startsWith("reviewer:")) {
+    const low = line.toLowerCase();
+    if (low.startsWith("reviewer:")) {
       out.reviewer = line.split(":").slice(1).join(":").trim();
-    } else if (line.toLowerCase().startsWith("rating:")) {
+    } else if (low.startsWith("rating:")) {
       const num = Number(line.replace(/rating:/i, "").trim());
       if (!Number.isNaN(num)) out.rating = num;
-    } else if (line.toLowerCase().startsWith("date:")) {
+    } else if (low.startsWith("date:")) {
       out.date = line.replace(/date:/i, "").trim();
-    } else if (line.toLowerCase().startsWith("source:")) {
+    } else if (low.startsWith("source:")) {
       out.sourceUrl = line.replace(/source:/i, "").trim();
     }
   }
 
+  // actual text
   const reviewLine = lines.find(
-    (l) =>
-      l.toLowerCase().startsWith("review:") ||
-      l.toLowerCase().startsWith("comment:")
+    (l) => l.toLowerCase().startsWith("review:") || l.toLowerCase().startsWith("comment:")
   );
   if (reviewLine) {
     out.review = reviewLine.split(":").slice(1).join(":").trim();
@@ -83,6 +85,7 @@ function parseReviewText(raw: string) {
   return out;
 }
 
+// figure out if row is FAQ or google-review
 function dbRowToSource(row: any): "faq" | "google-review" | "unknown" {
   const m = row.meta || {};
   const d = row.doc_meta || {};
@@ -95,14 +98,13 @@ function dbRowToSource(row: any): "faq" | "google-review" | "unknown" {
     d.sourceBucket ||
     row.sourceBucket ||
     "faq";
-  return source === "google-review"
-    ? "google-review"
-    : source === "faq"
-    ? "faq"
-    : "unknown";
+
+  if (source === "google-review") return "google-review";
+  if (source === "faq") return "faq";
+  return "unknown";
 }
 
-// temp in-memory reviews (kept for the “showReviews: true” second call)
+// fallback reviews in memory (used only if DB has no review rows)
 const FALLBACK_REVIEWS = [
   {
     text: "Loved the ready to wear saree! The fit and finishing were amazing.",
@@ -135,20 +137,13 @@ export async function OPTIONS() {
 }
 
 export async function GET() {
-  return new Response(JSON.stringify({ ok: true, msg: "search route is alive" }), {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Content-Type": "application/json",
-    },
-  });
+  return json({ ok: true, msg: "search route is alive" }, 200);
 }
 
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
     const query = (body?.query ?? "").toString().trim();
-    const wantReviewsOnly = !!body?.showReviews;
     const askDebug = !!body?.debug;
     const topK = Math.min(Math.max(Number(body?.topK ?? 12), 1), 30);
 
@@ -165,9 +160,8 @@ export async function POST(req: Request) {
       );
     }
 
-    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
     // 1) embed query
+    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
     const emb = await openai.embeddings.create({
       model: "text-embedding-3-small",
       input: query,
@@ -175,7 +169,7 @@ export async function POST(req: Request) {
     const queryEmbedding = emb.data[0].embedding;
     const vecLiteral = `[${queryEmbedding.join(",")}]`;
 
-    // 2) fetch chunks
+    // 2) fetch chunks from Postgres
     const client = new Client({ connectionString: SUPABASE_CONN });
     await client.connect();
 
@@ -197,10 +191,9 @@ export async function POST(req: Request) {
     const { rows } = await client.query(sql, [vecLiteral, topK]);
     await client.end();
 
-    // 3) normalize rows + parse reviews
+    // 3) normalize + parse
     const enriched = rows.map((r: any) => {
       const source = dbRowToSource(r);
-
       const base = {
         document_id: r.document_id,
         url: r.url,
@@ -227,69 +220,12 @@ export async function POST(req: Request) {
       return base;
     });
 
-    // 4) user explicitly asked for reviews
-    // 4) user explicitly asked for reviews (from the chatbot second step)
-if (wantReviewsOnly) {
-  // try to use real google-review rows we already fetched
-  const dbReviews = enriched.filter((r: any) => r.source === "google-review");
-
-  if (dbReviews.length > 0) {
-    const top = dbReviews.slice(0, 3).map((r: any) => ({
-      content: r.review?.text || r.content,
-      reviewer: r.review?.reviewer || null,
-      rating: r.review?.rating || null,
-      date: r.review?.date || null,
-      sourceUrl: r.review?.sourceUrl || null,
-    }));
-
-    return json(
-      {
-        ok: true,
-        query,
-        source: "google-review",
-        results: top,
-        reviewLink: REVIEW_GOOGLE_URL,
-      },
-      200
-    );
-  }
-
-  // fallback to in-memory ones only if DB has no review rows
-  const scored = FALLBACK_REVIEWS.map((r) => ({
-    ...r,
-    __score: scoreReview(r.text, query),
-    __date: r.date ? new Date(r.date).getTime() : 0,
-  }))
-    .filter((r) => r.__score > 0)
-    .sort((a, b) =>
-      b.__score !== a.__score ? b.__score - a.__score : b.__date - a.__date
-    );
-
-  const top = scored.slice(0, 3);
-  return json(
-    {
-      ok: true,
-      query,
-      source: "google-review",
-      results: top.map((r) => ({
-        content: r.text,
-        date: r.date,
-        reviewer: null,
-        rating: null,
-        sourceUrl: REVIEW_GOOGLE_URL,
-      })),
-      reviewLink: REVIEW_GOOGLE_URL,
-    },
-    200
-  );
-}
-
-    // 5) normal FAQ first
+    // ========== FAQ PART ==========
     let faqHits = enriched
       .filter((r: any) => r.source === "faq" && r.similarity >= FAQ_MIN_SIM)
       .slice(0, MAX_RETURN);
 
-    // 5a) RESCUE for order/delivery FAQ
+    // rescue for order/delivery queries
     if (faqHits.length === 0) {
       const normQ = normalize(query);
       const looksLikeOrder = ORDER_KEYWORDS.some((kw) =>
@@ -315,58 +251,78 @@ if (wantReviewsOnly) {
       }
     }
 
-    if (faqHits.length > 0) {
-      return json(
-        {
-          ok: true,
-          query,
-          source: "faq",
-          results: faqHits.map((r) => ({
-            content: r.content,
-            similarity: r.similarity,
-          })),
-          canShowReviews: true,
-          ...(askDebug ? { debug: { top: enriched.slice(0, 8) } } : {}),
-        },
-        200
-      );
-    }
+    const faqBlock = {
+      found: faqHits.length > 0,
+      items: faqHits.map((r: any) => ({
+        content: r.content,
+        similarity: r.similarity,
+        source: "faq" as const,
+        url: r.url || null,
+      })),
+    };
 
-    // 6) fallback to DB reviews (the ones you ingested)
-    const dbReviews = enriched.filter(
+    // ========== REVIEWS PART ==========
+    // real DB reviews
+    const dbReviewsRaw = enriched.filter(
       (r: any) => r.source === "google-review"
     );
 
-    const topDbReviews = dbReviews.slice(0, 3).map((r: any) => ({
-      content: r.review?.text || r.content,
-      reviewer: r.review?.reviewer || null,
-      rating: r.review?.rating || null,
-      date: r.review?.date || null,
-      sourceUrl: r.review?.sourceUrl || null,
-    }));
+    let reviewItems: any[] = [];
 
-    if (topDbReviews.length > 0) {
-      return json(
-        {
-          ok: true,
-          query,
+    if (dbReviewsRaw.length > 0) {
+      // score by query overlap
+      reviewItems = dbReviewsRaw
+        .map((r: any) => {
+          const textForScore = r.review?.text || r.content || "";
+          const sc = scoreReview(textForScore, query);
+          return { ...r, __score: sc };
+        })
+        .sort((a: any, b: any) => b.__score - a.__score)
+        .slice(0, 3)
+        .map((r: any) => ({
           source: "google-review",
-          results: topDbReviews,
-          reviewLink: REVIEW_GOOGLE_URL,
-          ...(askDebug ? { debug: { top: enriched.slice(0, 8) } } : {}),
-        },
-        200
-      );
+          reviewer: r.review?.reviewer || null,
+          rating: r.review?.rating || null,
+          date: r.review?.date || null,
+          text: r.review?.text || r.content,
+          sourceUrl: r.review?.sourceUrl || null,
+        }));
+    } else {
+      // fallback to in-memory ones
+      reviewItems = FALLBACK_REVIEWS
+        .map((r) => ({
+          ...r,
+          __score: scoreReview(r.text, query),
+        }))
+        .sort((a, b) => b.__score - a.__score)
+        .slice(0, 3)
+        .map((r) => ({
+          source: "google-review",
+          reviewer: null,
+          rating: null,
+          date: r.date,
+          text: r.text,
+          sourceUrl: REVIEW_GOOGLE_URL,
+        }));
     }
 
-    // 7) nothing at all
+    const reviewsBlock = {
+      items: reviewItems,
+      googleLink: REVIEW_GOOGLE_URL,
+    };
+
+    // final shape — ALWAYS send faq + reviews
     return json(
       {
         ok: true,
         query,
-        source: "none",
-        results: [],
-        message: "I couldn’t find this in FAQs or reviews.",
+        source: faqBlock.found
+          ? "faq"
+          : reviewItems.length > 0
+          ? "google-review"
+          : "none",
+        faq: faqBlock,
+        reviews: reviewsBlock,
         ...(askDebug ? { debug: { top: enriched.slice(0, 8) } } : {}),
       },
       200

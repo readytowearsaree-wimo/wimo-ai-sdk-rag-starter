@@ -27,6 +27,65 @@ function scoreReview(reviewText: string, query: string): number {
   }
   return hits;
 }
+function parseReviewText(raw: string) {
+  // default
+  const out: {
+    reviewer?: string;
+    rating?: number;
+    date?: string;
+    review?: string;
+    sourceUrl?: string;
+    raw: string;
+  } = { raw };
+
+  if (!raw) return out;
+
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+  for (const line of lines) {
+    if (line.toLowerCase().startsWith('reviewer:')) {
+      out.reviewer = line.split(':').slice(1).join(':').trim();
+    } else if (line.toLowerCase().startsWith('rating:')) {
+      const num = Number(line.replace(/rating:/i, '').trim());
+      if (!Number.isNaN(num)) out.rating = num;
+    } else if (line.toLowerCase().startsWith('date:')) {
+      out.date = line.replace(/date:/i, '').trim();
+    } else if (line.toLowerCase().startsWith('source:')) {
+      out.sourceUrl = line.replace(/source:/i, '').trim();
+    }
+  }
+
+  // find the first line that looks like the actual review
+  const reviewLine = lines.find(l =>
+    l.toLowerCase().startsWith('review:') ||
+    l.toLowerCase().startsWith('comment:')
+  );
+  if (reviewLine) {
+    out.review = reviewLine.split(':').slice(1).join(':').trim();
+  } else {
+    // fallback: use the whole thing
+    out.review = raw.trim();
+  }
+
+  return out;
+}
+
+function dbRowToSource(row: any): 'faq' | 'google-review' | 'unknown' {
+  // we fixed this earlier, but keep it safe
+  const m = row.meta || {};
+  const d = row.doc_meta || {};
+  const source =
+    m.source ||
+    m.type ||
+    m.sourceBucket ||
+    d.source ||
+    d.type ||
+    d.sourceBucket ||
+    row.sourceBucket ||
+    'faq';
+  return source === 'google-review' ? 'google-review' : source === 'faq' ? 'faq' : 'unknown';
+}
+
 
 // placeholder; you can remove once reviews table is used
 const REVIEWS = [
@@ -109,21 +168,37 @@ export async function POST(req: Request) {
     await client.end();
 
     // 3) normalize source
-    const enriched = rows.map((r: any) => {
-      // documents.meta is set, but document_chunks.meta was null for FAQ
-      // so we fallback to: if url contains google → google-review, else faq
-      const source =
-        (r.meta && typeof r.meta === "object" && (r.meta.source || r.meta.type)) ||
-        (r.url?.includes("google") ? "google-review" : "faq");
-      return {
-        document_id: r.document_id,
-        url: r.url,
-        source,
-        chunk_index: r.chunk_index,
-        content: r.content,
-        similarity: Number(r.similarity),
-      };
-    });
+   const enriched = rows.map((r: any) => {
+  const source = dbRowToSource(r);
+
+  // base object
+  const base = {
+    document_id: r.document_id,
+    url: r.url,
+    source,
+    chunk_index: r.chunk_index,
+    content: r.content,
+    similarity: Number(r.similarity),
+  };
+
+  // if it's a google review, try to extract fields
+  if (source === 'google-review') {
+    const parsed = parseReviewText(r.content || '');
+    return {
+      ...base,
+      review: {
+        reviewer: parsed.reviewer || null,
+        rating: parsed.rating || null,
+        date: parsed.date || null,
+        text: parsed.review || parsed.raw,
+        sourceUrl: parsed.sourceUrl || null,
+      },
+    };
+  }
+
+  return base;
+});
+
 
     // 4) user clicked "yes, check reviews" -> you already added this in Wix
     if (wantReviewsOnly) {
@@ -173,31 +248,32 @@ export async function POST(req: Request) {
       );
     }
 
-    // 6) fallback to reviews
-    const scored = REVIEWS.map((r) => ({
-      ...r,
-      __score: scoreReview(r.text, query),
-      __date: r.date ? new Date(r.date).getTime() : 0,
-    }))
-      .filter((r) => r.__score > 0)
-      .sort((a, b) =>
-        b.__score !== a.__score ? b.__score - a.__score : b.__date - a.__date
-      );
+   // 6) fallback to reviews — use actual google-review rows from DB
+const dbReviews = enriched.filter((r: any) => r.source === 'google-review');
 
-    const topReviews = scored.slice(0, 3);
-    if (topReviews.length > 0) {
-      return json(
-        {
-          ok: true,
-          query,
-          source: "google-review",
-          results: topReviews.map((r) => ({ content: r.text, date: r.date })),
-          reviewLink: REVIEW_GOOGLE_URL,
-          ...(askDebug ? { debug: { top: enriched.slice(0, 8) } } : {}),
-        },
-        200
-      );
-    }
+// simple relevance (you can later add cosine sim scoring if needed)
+const topReviews = dbReviews.slice(0, 3).map((r: any) => ({
+  content: r.review?.text || r.content,
+  reviewer: r.review?.reviewer || null,
+  rating: r.review?.rating || null,
+  date: r.review?.date || null,
+  sourceUrl: r.review?.sourceUrl || null,
+}));
+
+if (topReviews.length > 0) {
+  return json(
+    {
+      ok: true,
+      query,
+      source: 'google-review',
+      results: topReviews,
+      reviewLink: REVIEW_GOOGLE_URL,
+      ...(askDebug ? { debug: { top: enriched.slice(0, 8) } } : {}),
+    },
+    200
+  );
+}
+
 
     // 7) truly nothing
     return json(

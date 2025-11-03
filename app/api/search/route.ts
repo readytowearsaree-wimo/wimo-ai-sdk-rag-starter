@@ -5,7 +5,7 @@ import pkg from "pg";
 const { Client } = pkg;
 
 /* -------------------- CONFIG -------------------- */
-const FAQ_MIN_SIM = 0.63; // looser so your FAQ wins more often
+const FAQ_MIN_SIM = 0.55; // looser so your FAQ wins more often
 const MAX_RETURN = 3;
 const REVIEW_GOOGLE_URL =
   "https://www.google.com/search?q=wimo+ready+to+wear+saree+reviews";

@@ -228,29 +228,61 @@ export async function POST(req: Request) {
     });
 
     // 4) user explicitly asked for reviews
-    if (wantReviewsOnly) {
-      const scored = FALLBACK_REVIEWS.map((r) => ({
-        ...r,
-        __score: scoreReview(r.text, query),
-        __date: r.date ? new Date(r.date).getTime() : 0,
-      }))
-        .filter((r) => r.__score > 0)
-        .sort((a, b) =>
-          b.__score !== a.__score ? b.__score - a.__score : b.__date - a.__date
-        );
+    // 4) user explicitly asked for reviews (from the chatbot second step)
+if (wantReviewsOnly) {
+  // try to use real google-review rows we already fetched
+  const dbReviews = enriched.filter((r: any) => r.source === "google-review");
 
-      const top = scored.slice(0, 3);
-      return json(
-        {
-          ok: true,
-          query,
-          source: "google-review",
-          results: top.map((r) => ({ content: r.text, date: r.date })),
-          reviewLink: REVIEW_GOOGLE_URL,
-        },
-        200
-      );
-    }
+  if (dbReviews.length > 0) {
+    const top = dbReviews.slice(0, 3).map((r: any) => ({
+      content: r.review?.text || r.content,
+      reviewer: r.review?.reviewer || null,
+      rating: r.review?.rating || null,
+      date: r.review?.date || null,
+      sourceUrl: r.review?.sourceUrl || null,
+    }));
+
+    return json(
+      {
+        ok: true,
+        query,
+        source: "google-review",
+        results: top,
+        reviewLink: REVIEW_GOOGLE_URL,
+      },
+      200
+    );
+  }
+
+  // fallback to in-memory ones only if DB has no review rows
+  const scored = FALLBACK_REVIEWS.map((r) => ({
+    ...r,
+    __score: scoreReview(r.text, query),
+    __date: r.date ? new Date(r.date).getTime() : 0,
+  }))
+    .filter((r) => r.__score > 0)
+    .sort((a, b) =>
+      b.__score !== a.__score ? b.__score - a.__score : b.__date - a.__date
+    );
+
+  const top = scored.slice(0, 3);
+  return json(
+    {
+      ok: true,
+      query,
+      source: "google-review",
+      results: top.map((r) => ({
+        content: r.text,
+        date: r.date,
+        reviewer: null,
+        rating: null,
+        sourceUrl: REVIEW_GOOGLE_URL,
+      })),
+      reviewLink: REVIEW_GOOGLE_URL,
+    },
+    200
+  );
+}
 
     // 5) normal FAQ first
     let faqHits = enriched

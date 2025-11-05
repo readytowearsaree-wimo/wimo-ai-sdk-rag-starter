@@ -1,107 +1,104 @@
-import { NextResponse } from "next/server";
-import { v4 as uuidv4 } from "uuid";
-import pkg from "pg";
+// app/api/ingest/route.ts
+import { NextRequest } from "next/server";
 
-const { Client } = pkg;
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-// very dumb chunker: split every 800 chars
-function chunkText(text: string, size = 800): string[] {
-  const chunks: string[] = [];
-  let i = 0;
-  while (i < text.length) {
-    chunks.push(text.slice(i, i + size));
-    i += size;
-  }
-  return chunks;
+/** ---- Replace these with your real functions ---- **/
+async function ingestOne(doc: { url: string; title?: string | null; text: string }) {
+  // TODO: Split text -> create embeddings -> upsert into `documents` and `document_chunks`.
+  // doc.url is required, doc.title is optional, doc.text is full content
+  // Return whatever you want; here we just echo.
+  return { ok: true, url: doc.url, length: doc.text.length };
+}
+/** ------------------------------------------------ **/
+
+function authOk(req: NextRequest) {
+  const expected = process.env.INGEST_SECRET?.trim();
+  if (!expected) return true; // if you didn't set a secret, let it through
+  const h1 = req.headers.get("x-ingest-secret")?.trim();
+  const h2 = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
+  return h1 === expected || h2 === expected;
 }
 
-export async function POST(req: Request) {
-  const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-  const SUPABASE_CONN = process.env.SUPABASE_CONN;
+async function parseMultipart(req: NextRequest) {
+  const form = await req.formData();
+  const file = form.get("file") as File | null;
+  if (!file) return null;
+  const text = await file.text();
+  const url = (form.get("url") as string | null) ?? `faq://upload-${Date.now()}`;
+  const title = (form.get("title") as string | null) ?? null;
+  return [{ url, title, text }];
+}
 
-  if (!OPENAI_API_KEY || !SUPABASE_CONN) {
-    return NextResponse.json(
-      { ok: false, error: "Missing OPENAI_API_KEY or SUPABASE_CONN" },
+async function parseJSON(req: NextRequest) {
+  let payload: any;
+  try {
+    payload = await req.json();
+  } catch {
+    return null;
+  }
+
+  // Shape A: { url, text }
+  if (payload && typeof payload.url === "string" && typeof payload.text === "string") {
+    return [{ url: payload.url, title: payload.title ?? null, text: payload.text }];
+  }
+
+  // Shape B: { documents: [ { title, url, content } ] }
+  if (payload && Array.isArray(payload.documents)) {
+    const out: Array<{ url: string; title?: string | null; text: string }> = [];
+    for (const d of payload.documents) {
+      if (d && typeof d.url === "string" && typeof d.content === "string") {
+        out.push({ url: d.url, title: d.title ?? null, text: d.content });
+      }
+    }
+    return out.length ? out : null;
+  }
+
+  return null;
+}
+
+export async function POST(req: NextRequest) {
+  if (!authOk(req)) {
+    return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
+
+  const ctype = req.headers.get("content-type") || "";
+
+  let docs:
+    | Array<{ url: string; title?: string | null; text: string }>
+    | null = null;
+
+  if (ctype.startsWith("multipart/form-data")) {
+    docs = await parseMultipart(req);
+  } else if (ctype.includes("application/json")) {
+    docs = await parseJSON(req);
+  } else {
+    // Some clients send no Content-Type; try JSON then multipart as a fallback
+    docs = (await parseJSON(req)) ?? (await parseMultipart(req));
+  }
+
+  if (!docs || !docs.length) {
+    return Response.json(
+      {
+        ok: false,
+        error:
+          "Invalid payload. Send either {url, text}, or {documents:[{title?, url, content}]}, or multipart with file (and optional url).",
+      },
       { status: 400 }
     );
   }
 
-  const client = new Client({ connectionString: SUPABASE_CONN });
-  await client.connect();
-
-  try {
-    const body = await req.json();
-    const { url, text, sourceBucket } = body as {
-      url?: string;
-      text?: string;
-      sourceBucket?: string;
-    };
-
-    // ----- CASE 1: plain text (what we're doing for Google reviews) -----
-    if (text && !url) {
-      const docId = uuidv4();
-
-      // 1) insert into documents
-      await client.query(
-        `INSERT INTO documents (id, url, content, meta)
-         VALUES ($1, $2, $3, $4)`,
-        [
-          docId,
-          null,
-          text,
-          { source: sourceBucket ?? "google-review" }, // stays jsonb
-        ]
-      );
-
-      // 2) make chunks
-      const chunks = chunkText(text, 800);
-
-      let chunkIndex = 0;
-      for (const chunk of chunks) {
-        await client.query(
-          `INSERT INTO document_chunks
-             (id, document_id, chunk_index, content, embedding, meta)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [
-            uuidv4(),     // id
-            docId,        // document_id
-            chunkIndex,   // chunk_index
-            chunk,        // content
-            null,         // embedding - to be filled later
-            { source: sourceBucket ?? "google-review" }, // meta
-          ]
-        );
-        chunkIndex += 1;
-      }
-
-      await client.end();
-      return NextResponse.json({
-        ok: true,
-        message: "Inserted text + chunks",
-        chunks: chunkIndex,
-        docId,
-      });
+  const results = [];
+  for (const d of docs) {
+    if (!d.url || !d.text) {
+      results.push({ ok: false, url: d.url ?? null, error: "Missing url or text" });
+      continue;
     }
-
-    // ----- CASE 2: URL ingestion (your older path) -----
-    if (!url && !text) {
-      await client.end();
-      return NextResponse.json(
-        { ok: false, error: "No url or text provided" },
-        { status: 400 }
-      );
-    }
-
-    // ... your older URL flow here ...
-
-    await client.end();
-    return NextResponse.json({ ok: true, message: "URL ingestion complete" });
-  } catch (err: any) {
-    console.error("Ingest error:", err);
-    await client.end();
-    return NextResponse.json(
-      { ok: false, error: String(err.message || err) },
-      { status: 500 }
-    );
+    // Normalize Windows newlines just in case
+    d.text = d.text.replace(/\r\n/g, "\n");
+    results.push(await ingestOne(d));
   }
+
+  return Response.json({ ok: true, count: results.length, results });
 }

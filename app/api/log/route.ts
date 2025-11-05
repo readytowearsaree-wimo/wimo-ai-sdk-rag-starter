@@ -1,15 +1,15 @@
 // app/api/log/route.ts
-import { NextResponse } from 'next/server';
-import pkg from 'pg';
-
+import { NextResponse } from "next/server";
+import pkg from "pg";
 const { Client } = pkg;
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 const corsHeaders = {
-  'access-control-allow-origin': '*',
-  'access-control-allow-methods': 'POST,OPTIONS',
-  'access-control-allow-headers': 'content-type',
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "POST,OPTIONS",
+  "access-control-allow-headers": "content-type",
 };
 
 export async function OPTIONS() {
@@ -18,43 +18,57 @@ export async function OPTIONS() {
 
 export async function POST(req: Request) {
   const client = new Client({
-    connectionString: process.env.SUPABASE_CONN, // same as /api/ingest
+    connectionString: process.env.SUPABASE_CONN,
     ssl: { rejectUnauthorized: false },
   });
 
   try {
     const body = await req.json();
-    if (!body?.query_text) {
+    const {
+      session_id,
+      url_path,
+      user_agent,
+      query_text,
+      response_type,
+      faq_id,
+      faq_title,
+      reviews_count,
+      response_ms,
+      response_text,         // 👈 new field
+    } = body;
+
+    if (!query_text) {
       return NextResponse.json(
-        { error: 'query_text required' },
+        { error: "query_text required" },
         { status: 400, headers: corsHeaders }
       );
     }
 
     await client.connect();
-
     await client.query(
       `insert into public.chat_queries
          (asked_at, session_id, url_path, user_agent, query_text,
-          response_type, faq_id, faq_title, reviews_count, response_ms)
-       values (now(), $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          response_type, faq_id, faq_title, reviews_count, response_ms, response_text)
+       values (now(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [
-        body.session_id ?? null,
-        body.url_path ?? null,
-        body.user_agent ?? null,
-        body.query_text,
-        body.response_type ?? 'fallback',
-        body.faq_id ?? null,
-        body.faq_title ?? null,
-        body.reviews_count ?? null,
-        body.response_ms ?? null,
+        session_id ?? null,
+        url_path ?? null,
+        user_agent ?? null,
+        query_text,
+        response_type ?? "fallback",
+        faq_id ?? null,
+        faq_title ?? null,
+        reviews_count ?? null,
+        response_ms ?? null,
+        response_text ?? null,  // 👈 store it
       ]
     );
 
     return NextResponse.json({ ok: true }, { headers: corsHeaders });
-  } catch (e: any) {
+  } catch (err: any) {
+    console.error("log error:", err);
     return NextResponse.json(
-      { error: e?.message || 'unknown' },
+      { error: err?.message || "unknown" },
       { status: 500, headers: corsHeaders }
     );
   } finally {

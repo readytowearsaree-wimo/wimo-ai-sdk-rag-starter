@@ -4,29 +4,40 @@ import { NextRequest } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** ---- Replace these with your real functions ---- **/
+/** Replace with your real ingestion logic */
 async function ingestOne(doc: { url: string; title?: string | null; text: string }) {
-  // TODO: Split text -> create embeddings -> upsert into `documents` and `document_chunks`.
-  // doc.url is required, doc.title is optional, doc.text is full content
-  // Return whatever you want; here we just echo.
   return { ok: true, url: doc.url, length: doc.text.length };
 }
-/** ------------------------------------------------ **/
 
-function authOk(req: NextRequest) {
-  const expected = process.env.INGEST_SECRET?.trim();
-  if (!expected) return true; // if you didn't set a secret, let it through
-  const h1 = req.headers.get("x-ingest-secret")?.trim();
-  const h2 = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
-  return h1 === expected || h2 === expected;
+/* ---------- AUTH HELPERS ---------- */
+
+function getProvidedSecret(req: NextRequest) {
+  const h1 = req.headers.get("x-ingest-secret") || "";
+  const auth = req.headers.get("authorization") || "";
+  const fromAuth = auth.replace(/^Bearer\s+/i, "");
+  return (h1 || fromAuth).trim();
 }
+
+function secretsMatch(expected?: string | null, provided?: string | null) {
+  expected = (expected ?? "").trim();
+  provided = (provided ?? "").trim();
+  if (!expected || !provided) return false;
+  if (expected.length !== provided.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) {
+    diff |= expected.charCodeAt(i) ^ provided.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+/* ---------- PAYLOAD PARSERS ---------- */
 
 async function parseMultipart(req: NextRequest) {
   const form = await req.formData();
   const file = form.get("file") as File | null;
   if (!file) return null;
   const text = await file.text();
-  const url = (form.get("url") as string | null) ?? `faq://upload-${Date.now()}`;
+  const url = (form.get("url") as string | null) ?? `faq-upload-${Date.now()}`;
   const title = (form.get("title") as string | null) ?? null;
   return [{ url, title, text }];
 }
@@ -38,13 +49,11 @@ async function parseJSON(req: NextRequest) {
   } catch {
     return null;
   }
-
-  // Shape A: { url, text }
+  // Shape A: { url, text, title? }
   if (payload && typeof payload.url === "string" && typeof payload.text === "string") {
     return [{ url: payload.url, title: payload.title ?? null, text: payload.text }];
   }
-
-  // Shape B: { documents: [ { title, url, content } ] }
+  // Shape B: { documents: [{ title?, url, content }] }
   if (payload && Array.isArray(payload.documents)) {
     const out: Array<{ url: string; title?: string | null; text: string }> = [];
     for (const d of payload.documents) {
@@ -54,27 +63,30 @@ async function parseJSON(req: NextRequest) {
     }
     return out.length ? out : null;
   }
-
   return null;
 }
 
+/* ---------- HANDLER ---------- */
+
 export async function POST(req: NextRequest) {
-  if (!authOk(req)) {
+  const expected = process.env.INGEST_SECRET ?? "";
+  const provided = getProvidedSecret(req);
+
+  // TEMP debug (remove after it passes once)
+  console.log("🔐 expected len:", expected.trim().length, "provided len:", provided.length);
+
+  if (!secretsMatch(expected, provided)) {
     return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }
 
   const ctype = req.headers.get("content-type") || "";
-
-  let docs:
-    | Array<{ url: string; title?: string | null; text: string }>
-    | null = null;
+  let docs: Array<{ url: string; title?: string | null; text: string }> | null = null;
 
   if (ctype.startsWith("multipart/form-data")) {
     docs = await parseMultipart(req);
   } else if (ctype.includes("application/json")) {
     docs = await parseJSON(req);
   } else {
-    // Some clients send no Content-Type; try JSON then multipart as a fallback
     docs = (await parseJSON(req)) ?? (await parseMultipart(req));
   }
 
@@ -83,7 +95,7 @@ export async function POST(req: NextRequest) {
       {
         ok: false,
         error:
-          "Invalid payload. Send either {url, text}, or {documents:[{title?, url, content}]}, or multipart with file (and optional url).",
+          "Invalid payload. Send either {url, text, title?}, or {documents:[{title?, url, content}]}, or multipart with file (and optional url).",
       },
       { status: 400 }
     );
@@ -95,8 +107,7 @@ export async function POST(req: NextRequest) {
       results.push({ ok: false, url: d.url ?? null, error: "Missing url or text" });
       continue;
     }
-    // Normalize Windows newlines just in case
-    d.text = d.text.replace(/\r\n/g, "\n");
+    d.text = d.text.replace(/\r\n/g, "\n"); // normalize newlines
     results.push(await ingestOne(d));
   }
 

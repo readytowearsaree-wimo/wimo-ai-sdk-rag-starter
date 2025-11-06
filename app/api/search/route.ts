@@ -1,13 +1,10 @@
-// /app/api/search/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { Pool } from "pg";
-export const runtime = "nodejs";
-export async function GET() {
-  return NextResponse.json({ ok: true, route: "/api/ping" });
-}
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
 
 /* ---------- CORS ---------- */
 function cors(res: NextResponse) {

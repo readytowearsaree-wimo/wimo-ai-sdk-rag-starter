@@ -1,8 +1,5 @@
-// app/api/ingest/route.ts
-import { NextResponse } from 'next/server';
-
-// Simple health check so we know the route is wired up
+import { NextResponse } from "next/server";
+export const runtime = "nodejs";
 export async function GET() {
-  return NextResponse.json({ ok: true, msg: 'ingest route is alive' });
+  return NextResponse.json({ ok: true, route: "/api/ping" });
 }
-

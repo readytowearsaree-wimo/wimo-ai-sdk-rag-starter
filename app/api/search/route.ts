@@ -1,86 +1,69 @@
-// /app/api/search/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { Pool } from "pg";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+const pool = new Pool({ connectionString: process.env.SUPABASE_CONN! });
 
-// Use your Supabase Postgres connection string (service role or anon with RLS allowed)
-const pool = new Pool({
-  connectionString: process.env.SUPABASE_CONN, // e.g. postgresql://user:pass@host:5432/postgres
-  // ssl: { rejectUnauthorized: false }, // uncomment if your DB requires SSL
-});
+function ok(body: any, init: number = 200) {
+  return NextResponse.json(body, { status: init });
+}
 
 export async function POST(req: NextRequest) {
+  let client;
   try {
     const { query } = await req.json();
     const userQuery = String(query || "").trim();
+    if (!userQuery) return ok({ faq: { found: false, items: [] } });
 
-    if (!userQuery) {
-      return NextResponse.json(
-        { faq: { found: false, items: [] }, reviews: { items: [] } },
-        { status: 200 }
-      );
-    }
-
-    // 1) Embed the query
     const emb = await openai.embeddings.create({
       model: "text-embedding-3-small",
       input: userQuery,
     });
     const vec = emb.data[0].embedding;
-    if (!vec || vec.length !== 1536) throw new Error("Bad embedding shape");
-
+    if (!vec || vec.length !== 1536) throw new Error("Bad embedding");
     const vecLiteral = `[${vec.join(",")}]`;
 
-    // 2) Vector search on CHUNKS (not documents), limit 5
-    //    IMPORTANT: lower the cutoff so short queries like "plus size" pass.
     const sql = `
       WITH q AS (SELECT $1::vector(1536) AS v)
-      SELECT 
+      SELECT
         d.id,
         d.url,
         d.title,
         dc.content,
-        1 - (dc.embedding <=> q.v) AS similarity
+        1 - (dc.embedding <=> q.v) AS emb_sim,
+        CASE
+          WHEN to_tsvector('simple', dc.content) @@ plainto_tsquery('simple', $2) THEN 1
+          ELSE 0
+        END AS fts_hit
       FROM public.document_chunks dc
       JOIN public.documents d ON d.id = dc.document_id
       JOIN q ON TRUE
-      WHERE d.url LIKE 'faq://%'
-      ORDER BY dc.embedding <-> q.v
-      LIMIT 5;
+      WHERE d.url LIKE 'faq://%%'
+      ORDER BY fts_hit DESC, (dc.embedding <-> q.v) ASC
+      LIMIT 10;
     `;
 
-    const client = await pool.connect();
-    const { rows } = await client.query(sql, [vecLiteral]);
-    client.release();
+    client = await pool.connect();
+    const { rows } = await client.query(sql, [vecLiteral, userQuery]);
+    const MIN_SIM = 0.45;
 
-    // 3) Pick the best item and apply a friendly threshold (0.55–0.60)
-    const best = rows?.[0];
-    const MIN_SIM = 0.55; // <- tune later; your test printed ~0.697 for "plus size"
-    const found = !!best && Number(best.similarity) >= MIN_SIM;
+    const items = (rows || [])
+      .map((r) => ({
+        id: r.id as string,
+        url: (r.url as string) ?? null,
+        title: (r.title as string) ?? null,
+        content: r.content as string,
+        similarity: Number(r.emb_sim),
+      }))
+      .filter((it) => it.similarity >= MIN_SIM)
+      .slice(0, 5);
 
-    const items = (rows || []).map((r) => ({
-      id: r.id,
-      url: r.url,
-      title: r.title ?? null,
-      content: r.content, // your frontend strips "A:" etc. itself
-      similarity: Number(r.similarity),
-    }));
-
-    // 4) Return exactly what the frontend expects
-    return NextResponse.json(
-      {
-        faq: { found, items },
-        reviews: { items: [], googleLink: null }, // optional; your UI handles empty
-      },
-      { status: 200 }
-    );
+    return ok({ faq: { found: items.length > 0, items } });
   } catch (err) {
-    console.error("/api/search error", err);
-    return NextResponse.json(
-      { faq: { found: false, items: [] }, reviews: { items: [] } },
-      { status: 200 }
-    );
+    console.error("[/api/answer] error", err);
+    return ok({ faq: { found: false, items: [] } });
+  } finally {
+    if (client) client.release();
   }
 }
